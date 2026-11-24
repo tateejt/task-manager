@@ -289,7 +289,14 @@ class NudgeWindow:
             [
                 lights,
                 ft.Container(
-                    self.text("Nudge", size=12, tone="dim", weight="medium"),
+                    ft.Row(
+                        [
+                            ft.Image(src="nudge.png", width=16, height=16),
+                            self.text("Nudge", size=12, tone="dim", weight="medium"),
+                        ],
+                        spacing=6,
+                        tight=True,
+                    ),  # fmt: skip
                     expand=True,
                     alignment=ft.Alignment.CENTER,
                 ),  # fmt: skip

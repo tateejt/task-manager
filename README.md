@@ -1,4 +1,6 @@
-# ⏰ Nudge
+<img src="src/nudge/assets/nudge-512.png" width="96" alt="Nudge icon">
+
+# Nudge
 
 A modern terminal reminder app for Windows. Tell it what you need to do and when, in plain English,
 and it pops a Windows notification with **Done**, **Snooze** and **Skip** buttons when it's time.
@@ -132,7 +134,7 @@ src/nudge/
   notify.py     notification content + Windows toasts (windows-toasts), console fallback elsewhere
   forms.py      the guided new/edit form with live preview (Textual)
   gui/          the desktop window (Flet): app.py window + tray, presenter.py display logic, theme.py
-  assets/       notification icons (tools/make_icons.py) and fonts (Inter, JetBrains Mono; OFL)
+  assets/       app and notification icons (tools/make_icons.py) and fonts (Inter, JetBrains Mono; OFL)
   startup.py    HKCU Run key so the runner starts at sign-in via pythonw (no window)
   cli.py        Typer + Rich commands
   tui.py        Textual dashboard
