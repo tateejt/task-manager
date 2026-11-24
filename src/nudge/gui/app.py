@@ -1,12 +1,17 @@
-"""The Nudge desktop window (Flet).
+"""The Nudge desktop window (Flet), in a quiet, calculator-like style.
 
-It uses the same database, schedule parser and notifier as the command line. While the window
-(or its tray icon) is open it also runs the reminder loop, unless a separate `nudge run` already is.
+One input line at the top reads what you type ("Water plants every mon at 9am") and shows what it
+understood on the right, like a calculator result. Enter adds it. Underneath is a plain list of what's
+next; click a row to edit it in place. There are no pop-up dialogs.
+
+It uses the same database, schedule parser and notifier as the command line. While the window (or its
+tray icon) is open it also sends notifications, unless a separate ``nudge run`` already is.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import queue
 from collections.abc import Callable
@@ -14,45 +19,56 @@ from datetime import datetime, timedelta
 
 import flet as ft
 
-from ..config import Settings, db_path
+from .. import __version__
+from ..config import Settings, data_dir, db_path
+from ..models import Reminder
 from ..notify import Action, asset_path, make_notifier
 from ..runner import SingleInstance, tick
-from ..schedule import (
-    EXAMPLES,
-    PRIORITY_LABEL,
-    REPEAT_CHOICES,
-    ScheduleError,
-    build_expression,
-    explain,
-    extract_inline_meta,
-    schedule_in_title,
-)
+from ..schedule import PRIORITY_LABEL, ScheduleError, explain, extract_inline_meta
 from ..service import AlreadyDone, NotFound, NothingToUndo, ReminderService
-from .presenter import PRIORITY_COLOURS, Card, all_tags, greeting, sections, undo_message
+from .presenter import (
+    Card,
+    Parsed,
+    clock,
+    next_up,
+    parse_input,
+    sections,
+    today,
+    undo_message,
+)
+from .theme import DARK, FONTS, LIGHTS, Palette, pick
 
-ACCENT = "#6366F1"
-DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-SHOWS = {
-    "once": {"date", "times"},
-    "daily": {"times"},
-    "weekdays": {"times"},
-    "weekends": {"times"},
-    "days": {"days", "times"},
-    "interval": {"every", "unit"},
-    "ndays": {"every", "times"},
-    "nweeks": {"every", "days", "times"},
-    "monthly": {"every", "date", "times"},
-    "yearly": {"date", "times"},
-}
-DATE_HINTS = {"once": "tomorrow, friday, dec 3", "monthly": "1st, 15th, last", "yearly": "mar 14"}
+TABS = [("today", "Today"), ("upcoming", "Upcoming"), ("all", "All"), ("history", "History")]
+SNOOZES = [
+    (10, "10 minutes"),
+    (30, "30 minutes"),
+    (60, "1 hour"),
+    (180, "3 hours"),
+    ("tomorrow", "Tomorrow 9 AM"),
+]
+WEIGHTS = {"regular": "Inter", "medium": "Inter Medium", "semi": "Inter SemiBold"}
 
 
 def _now() -> datetime:
     return datetime.now().replace(microsecond=0)
 
 
-def soft(colour: str, opacity: float = 0.12) -> str:
-    return ft.Colors.with_opacity(opacity, colour)
+def _no_border():
+    return ft.NoInputBorder() if hasattr(ft, "NoInputBorder") else ft.InputBorder.NONE
+
+
+def _safe(handler: Callable) -> Callable:
+    """Hover events can still arrive for rows a refresh just replaced (Flet freezes those): ignore them."""
+
+    def run(e) -> None:
+        with contextlib.suppress(RuntimeError):
+            handler(e)
+
+    return run
+
+
+def _hovering(e) -> bool:
+    return str(getattr(e, "data", "")).lower() == "true"
 
 
 class NudgeWindow:
@@ -60,62 +76,75 @@ class NudgeWindow:
         self.page = page
         self.service = service
         self.minimized = minimized
+        self.tab = "today"
+        self.settings_open = False
         self.query = ""
-        self.view = 0
+        self.editor: InlineEditor | None = None
+        self.parsed = Parsed("empty")
+        self.flash_token = 0
         self.actions: queue.Queue[Action] = queue.Queue()
         self.lock = SingleInstance()
         self.owns_runner = False
         self.tray = None
+        self.p: Palette = DARK
+
+    # ------------------------------------------------------------------ text helpers
+
+    def text(self, value: str, size: float = 14, tone: str = "text", weight: str = "regular",
+             mono: bool = False, **kw) -> ft.Text:  # fmt: skip
+        family = ("Mono Medium" if weight != "regular" else "Mono") if mono else WEIGHTS[weight]
+        color = kw.pop("color", None) or self.p.tone(tone)
+        return ft.Text(value, size=size, color=color, font_family=family, **kw)
+
+    def link(self, label: str, on_click: Callable, tone: str = "dim", size: float = 12,
+             mono: bool = False) -> ft.Control:  # fmt: skip
+        t = self.text(label, size=size, tone=tone, mono=mono, weight="medium")
+        box = ft.Container(t, padding=ft.Padding.symmetric(horizontal=8, vertical=4), border_radius=6,
+                           on_click=lambda _: on_click())  # fmt: skip
+
+        def hover(e) -> None:
+            box.bgcolor = self.p.raised if _hovering(e) else None
+            self._refresh(box)
+
+        box.on_hover = _safe(hover)
+        return box
+
+    def icon_button(self, icon, on_click: Callable | None, tooltip: str, size: int = 16) -> ft.Control:
+        box = ft.Container(ft.Icon(icon, size=size, color=self.p.dim), width=28, height=28,
+                           alignment=ft.Alignment.CENTER, border_radius=6, tooltip=tooltip,
+                           on_click=(lambda _: on_click()) if on_click else None)  # fmt: skip
+
+        def hover(e) -> None:
+            box.bgcolor = self.p.raised if _hovering(e) else None
+            self._refresh(box)
+
+        box.on_hover = _safe(hover)
+        return box
+
+    def _refresh(self, control: ft.Control) -> None:
+        with contextlib.suppress(Exception):  # not mounted yet (or no running page, as in tests)
+            control.update()
 
     # ------------------------------------------------------------------ setup
 
     def start(self) -> None:
         p = self.page
         p.title = "Nudge"
-        p.theme = ft.Theme(color_scheme_seed=ACCENT)
-        p.dark_theme = ft.Theme(color_scheme_seed=ACCENT)
-        p.theme_mode = ft.ThemeMode.SYSTEM
+        p.fonts = dict(FONTS)
         p.padding = 0
         p.spacing = 0
         p.on_keyboard_event = self._on_key
+        p.on_platform_brightness_change = lambda _: self.build()
         win = p.window
         if win is not None:
-            win.width, win.height = 1080, 760
-            win.min_width, win.min_height = 720, 520
+            win.width, win.height = 600, 740
+            win.min_width, win.min_height = 460, 480
+            win.title_bar_hidden = True
+            win.title_bar_buttons_hidden = True
             ico = asset_path("nudge.ico")
             if ico.exists():
                 win.icon = str(ico)
-
-        self.rail = ft.NavigationRail(
-            selected_index=0,
-            label_type=ft.NavigationRailLabelType.ALL,
-            min_width=88,
-            group_alignment=-0.85,
-            leading=ft.Container(
-                ft.Image(src="nudge.png", width=40, height=40),
-                padding=ft.Padding.only(top=18, bottom=12),
-            ),
-            destinations=[
-                ft.NavigationRailDestination(
-                    icon=ft.Icons.NOTIFICATIONS_OUTLINED,
-                    selected_icon=ft.Icons.NOTIFICATIONS,
-                    label="Reminders",
-                ),
-                ft.NavigationRailDestination(
-                    icon=ft.Icons.CALENDAR_MONTH_OUTLINED,
-                    selected_icon=ft.Icons.CALENDAR_MONTH,
-                    label="Upcoming",
-                ),
-                ft.NavigationRailDestination(icon=ft.Icons.HISTORY, label="History"),
-                ft.NavigationRailDestination(
-                    icon=ft.Icons.SETTINGS_OUTLINED, selected_icon=ft.Icons.SETTINGS, label="Settings"
-                ),
-            ],  # fmt: skip
-            on_change=self._on_nav,
-        )
-        self.body = ft.Container(expand=True, padding=ft.Padding.symmetric(horizontal=28, vertical=20))
-        p.add(ft.Row([self.rail, ft.VerticalDivider(width=1), self.body], expand=True, spacing=0))
-        self.render()
+        self.build()
 
         self.owns_runner = self.lock.acquire()
         p.run_task(self._loop)
@@ -125,7 +154,151 @@ class NudgeWindow:
             win.on_event = self._on_window_event
             if self.minimized and self.tray is not None:
                 win.visible = False
-        p.update()
+        self.render()
+
+    def build(self) -> None:
+        """(Re)build the whole window, e.g. after switching between light and dark."""
+        brightness = getattr(self.page, "platform_brightness", None)
+        system_dark = None if brightness is None else brightness == ft.Brightness.DARK
+        self.p = pick(Settings.load().theme, system_dark)
+        p = self.page
+        p.bgcolor = self.p.bg
+        p.theme_mode = ft.ThemeMode.DARK if self.p.name == "dark" else ft.ThemeMode.LIGHT
+        theme = ft.Theme(
+            font_family="Inter",
+            color_scheme_seed=self.p.accent,
+            scaffold_bgcolor=self.p.bg,
+            splash_color=ft.Colors.TRANSPARENT,
+            highlight_color=ft.Colors.TRANSPARENT,
+            hover_color=self.p.raised,
+            popup_menu_theme=ft.PopupMenuTheme(
+                color=self.p.surface,
+                elevation=6,
+                label_text_style=ft.TextStyle(size=13, color=self.p.text, font_family="Inter"),
+            ),  # fmt: skip
+            tooltip_theme=ft.TooltipTheme(
+                text_style=ft.TextStyle(size=11, color=self.p.bg),
+                decoration=ft.BoxDecoration(bgcolor=self.p.text, border_radius=6),
+            ),  # fmt: skip
+        )
+        p.theme = theme
+        p.dark_theme = theme
+        if p.window is not None:
+            p.window.bgcolor = self.p.bg
+
+        old = getattr(self, "input", None)
+        self.input = ft.TextField(
+            value=old.value if old is not None else "",
+            hint_text="Remind me to…",
+            border=_no_border(),
+            text_style=ft.TextStyle(size=19, color=self.p.text, font_family="Inter"),
+            hint_style=ft.TextStyle(size=19, color=self.p.faint, font_family="Inter"),
+            cursor_color=self.p.accent,
+            selection_color=ft.Colors.with_opacity(0.3, self.p.accent),
+            content_padding=ft.Padding.symmetric(vertical=6),
+            autofocus=True,
+            expand=True,
+            on_change=lambda _: self._on_input(),
+            on_submit=lambda _: self.submit(),
+        )
+        self.result = self.text("", size=15, tone="accent", mono=True, weight="medium",
+                                text_align=ft.TextAlign.RIGHT)  # fmt: skip
+        self.detail = self.text("", size=11, tone="dim", mono=True, text_align=ft.TextAlign.RIGHT)
+        self.tabs = ft.Row(spacing=2)
+        self.filter_row = ft.Row(spacing=4)
+        self.body = ft.ListView(expand=True, spacing=0, padding=ft.Padding.only(left=10, right=10, bottom=16))
+        self.status = ft.Row(spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER, expand=True)
+        self.hints = self.text("Ctrl+K new · Ctrl+Z undo", size=11, tone="faint", mono=True)
+
+        hairline = ft.Container(height=1, bgcolor=self.p.line)
+        p.controls = [
+            ft.Column(
+                [
+                    self.title_bar(),
+                    ft.Container(
+                        ft.Row(
+                            [
+                                self.input,
+                                ft.Column(
+                                    [self.result, self.detail],
+                                    spacing=2,
+                                    horizontal_alignment=ft.CrossAxisAlignment.END,
+                                ),  # fmt: skip
+                            ],
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            spacing=16,
+                        ),
+                        padding=ft.Padding.only(left=22, right=22, top=6, bottom=14),
+                    ),
+                    hairline,
+                    ft.Container(
+                        ft.Row(
+                            [self.tabs, ft.Container(expand=True), self.filter_row],
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),  # fmt: skip
+                        padding=ft.Padding.only(left=14, right=14, top=10, bottom=6),
+                    ),
+                    self.body,
+                    hairline,
+                    ft.Container(
+                        ft.Row([self.status, self.hints], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                        padding=ft.Padding.symmetric(horizontal=18, vertical=9),
+                    ),
+                ],
+                spacing=0,
+                expand=True,
+            )
+        ]
+        if self.editor is not None:
+            self.editor = InlineEditor(self, self.service.get(self.editor.rid)) if self._exists(
+                self.editor.rid) else None  # fmt: skip
+        self._on_input(render=False)
+        self.render()
+
+    def title_bar(self) -> ft.Control:
+        glyphs = {"close": "×", "min": "–", "zoom": "+"}
+        dots: list[ft.Container] = []
+        for key, action in (("close", self._close), ("min", self._minimize), ("zoom", self._zoom)):
+            dots.append(
+                ft.Container(
+                    ft.Text(
+                        "",
+                        size=9,
+                        color="#4D0000",
+                        font_family="Inter SemiBold",
+                        text_align=ft.TextAlign.CENTER,
+                    ),  # fmt: skip
+                    width=12,
+                    height=12,
+                    border_radius=6,
+                    bgcolor=LIGHTS[key],
+                    alignment=ft.Alignment.CENTER,
+                    on_click=lambda _, a=action: a(),
+                    data=glyphs[key],
+                )
+            )
+        lights = ft.Container(ft.Row(dots, spacing=8), padding=ft.Padding.symmetric(vertical=6))
+
+        def hover(e) -> None:
+            for d in dots:
+                d.content.value = d.data if _hovering(e) else ""
+            self._refresh(lights)
+
+        lights.on_hover = _safe(hover)
+        bar = ft.Row(
+            [
+                lights,
+                ft.Container(
+                    self.text("Nudge", size=12, tone="dim", weight="medium"),
+                    expand=True,
+                    alignment=ft.Alignment.CENTER,
+                ),  # fmt: skip
+                self.icon_button(ft.Icons.TUNE, self.toggle_settings, "Settings (Ctrl+,)", size=15),
+            ],
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        inner = ft.Container(bar, padding=ft.Padding.only(left=16, right=10, top=8, bottom=2))
+        return ft.WindowDragArea(inner, maximizable=True) if hasattr(ft, "WindowDragArea") else inner
 
     # ------------------------------------------------------------------ background loop
 
@@ -133,16 +306,16 @@ class NudgeWindow:
         notifier = make_notifier(self.actions) if self.owns_runner else None
         while True:
             settings = Settings.load()
-            changed = False
             if notifier is not None:
                 before = self.actions.qsize()
                 shown = await asyncio.to_thread(tick, self.service, notifier, settings, self.actions)
-                changed = bool(shown or before)
-            if changed or self.view in (0, 1):
-                self.render()
+                if shown or before:
+                    self.render()
             await asyncio.sleep(min(settings.poll_seconds, 30))
+            if not self.settings_open:
+                self.render()  # keep "in 5m" style times fresh
 
-    # ------------------------------------------------------------------ tray
+    # ------------------------------------------------------------------ tray and window buttons
 
     def _start_tray(self) -> None:
         try:
@@ -159,7 +332,7 @@ class NudgeWindow:
 
         menu = pystray.Menu(
             pystray.MenuItem("Open Nudge", call(self.show_window), default=True),
-            pystray.MenuItem("New reminder…", call(lambda: (self.show_window(), self.open_form()))),
+            pystray.MenuItem("New reminder…", call(lambda: (self.show_window(), self.focus_input()))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit Nudge", call(self.quit)),
         )
@@ -182,317 +355,506 @@ class NudgeWindow:
         self.lock.release()
         self.page.run_task(self.page.window.destroy)
 
+    def _close(self) -> None:
+        if self.page.window is None:
+            return
+        if self.tray is not None:
+            self.page.window.visible = False  # keep reminding from the tray
+            self.page.update()
+        else:
+            self.quit()
+
+    def _minimize(self) -> None:
+        if self.page.window is not None:
+            self.page.window.minimized = True
+            self.page.update()
+
+    def _zoom(self) -> None:
+        if self.page.window is not None:
+            self.page.window.maximized = not self.page.window.maximized
+            self.page.update()
+
     def _on_window_event(self, e) -> None:
         if e.type == ft.WindowEventType.CLOSE:
-            if self.tray is not None:
-                self.page.window.visible = False  # keep reminding from the tray
-                self.page.update()
-                self.toast("Nudge is still running in the tray")
-            else:
-                self.quit()
+            self._close()
 
-    # ------------------------------------------------------------------ navigation
+    # ------------------------------------------------------------------ keyboard
 
-    def _on_nav(self, e) -> None:
-        self.view = e.control.selected_index
-        self.render()
+    def focus_input(self) -> None:
+        self.page.run_task(self.input.focus)
 
     def _on_key(self, e: ft.KeyboardEvent) -> None:
-        if e.key in ("N", "n") and (e.ctrl or e.meta):
-            self.open_form()
-        elif e.key in ("Z", "z") and (e.ctrl or e.meta):
+        ctrl = e.ctrl or e.meta
+        key = (e.key or "").lower()
+        if ctrl and key in ("k", "n"):
+            self.focus_input()
+        elif ctrl and key == "z" and not (self.input.value or ""):
             self.undo()
+        elif ctrl and key == ",":
+            self.toggle_settings()
+        elif ctrl and key in ("1", "2", "3", "4"):
+            self.set_tab(TABS[int(key) - 1][0])
+        elif key == "escape":
+            if self.editor is not None:
+                self.close_editor()
+            elif self.settings_open:
+                self.toggle_settings()
+            elif self.input.value:
+                self.input.value = ""
+                self._on_input()
+
+    # ------------------------------------------------------------------ the input line
+
+    def _on_input(self, render: bool = True) -> None:
+        now = _now()
+        self.parsed = parse_input(self.input.value or "", now)
+        pr = self.parsed
+        query = pr.query if pr.mode == "search" else ""
+        self.result.color = self.p.accent
+        if pr.mode == "add":
+            bits = [pr.detail, *[f"#{t}" for t in pr.tags]]
+            if pr.priority is not None and pr.priority != 1:
+                bits.append(PRIORITY_LABEL[pr.priority])
+            self.result.value, self.detail.value = pr.label, " · ".join(bits)
+        elif pr.mode == "search":
+            self.result.value, self.detail.value = "search", pr.detail
+            self.result.color = self.p.dim
+        elif pr.mode == "error":
+            self.result.value, self.detail.value = "?", pr.detail
+            self.result.color = self.p.red
+        elif pr.mode == "incomplete":
+            self.result.value, self.detail.value = "", pr.detail
+        else:
+            self.result.value, self.detail.value = "", "e.g. water plants every mon at 9am"
+        self.result.visible = bool(self.result.value)
+        if render and query != self.query:
+            self.query = query
+            self.render()
+        else:
+            self.query = query
+            self._refresh(self.result)
+            self._refresh(self.detail)
+
+    def submit(self) -> None:
+        pr = self.parsed
+        if pr.mode == "search":
+            return
+        if not pr.ok:
+            self.result.value = "?" if pr.mode != "empty" else ""
+            self.result.color = self.p.red
+            self.page.update()
+            self.focus_input()
+            return
+        try:
+            r = self.service.add(pr.title, pr.when, tags=pr.tags, priority=pr.priority)
+        except ScheduleError as e:
+            self.flash(str(e), warning=True)
+            return
+        self.input.value = ""
+        self._on_input(render=False)
+        if self.tab not in ("today", "all") or (self.tab == "today" and r.due_at.date() != _now().date()):
+            self.tab = "all"
+        self.render()
+        self.flash(f"Added {r.title} · {r.schedule_label}", undo=False)
+        self.focus_input()
+
+    # ------------------------------------------------------------------ tabs and lists
+
+    def set_tab(self, tab: str) -> None:
+        self.tab = tab
+        self.settings_open = False
+        self.editor = None
+        self.render()
+
+    def toggle_settings(self) -> None:
+        self.settings_open = not self.settings_open
+        self.editor = None
+        self.render()
 
     def render(self) -> None:
-        views = [self.reminders_view, self.upcoming_view, self.history_view, self.settings_view]
-        self.body.content = views[self.view]()
-        self.page.update()
-
-    # ------------------------------------------------------------------ reminders view
-
-    def header(self, title: str, subtitle: str, *actions: ft.Control) -> ft.Control:
-        return ft.Row(
-            [
-                ft.Column(
-                    [
-                        ft.Text(title, size=28, weight=ft.FontWeight.W_700),
-                        ft.Text(subtitle, size=14, color=ft.Colors.ON_SURFACE_VARIANT),
-                    ],
-                    spacing=2,
-                    expand=True,
-                ),  # fmt: skip
-                *actions,
-            ],
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-        )
-
-    def stat(self, label: str, value: str, colour: str, icon) -> ft.Control:
-        return ft.Container(
-            ft.Row(
-                [
-                    ft.Container(
-                        ft.Icon(icon, color=colour, size=20),
-                        bgcolor=soft(colour),
-                        padding=8,
-                        border_radius=10,
-                    ),  # fmt: skip
-                    ft.Column(
-                        [
-                            ft.Text(value, size=20, weight=ft.FontWeight.W_700),
-                            ft.Text(label, size=12, color=ft.Colors.ON_SURFACE_VARIANT),
-                        ],
-                        spacing=0,
-                    ),  # fmt: skip
-                ],
-                spacing=12,
-            ),
-            padding=ft.Padding.symmetric(horizontal=16, vertical=12),
-            border_radius=14,
-            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
-            expand=True,
-        )
-
-    def reminders_view(self) -> ft.Control:
         now = _now()
         reminders = self.service.list(include_inactive=True)
-        st = self.service.stats(now)
-        best = max((r.streak for r in reminders), default=0)
-        due_now = st.overdue
-        subtitle = (
-            f"{due_now} reminder{'s' if due_now != 1 else ''} need{'s' if due_now == 1 else ''} you now"
-            if due_now
-            else "You're all caught up"
-        )
-        search = ft.TextField(
-            value=self.query,
-            hint_text="Search or #tag",
-            prefix_icon=ft.Icons.SEARCH,
-            dense=True,
-            border_radius=12,
-            width=240,
-            on_change=self._on_search,
-        )
-        new_btn = ft.FilledButton("New reminder", icon=ft.Icons.ADD, on_click=lambda _: self.open_form(),
-                                  height=44)  # fmt: skip
-        tags = all_tags(reminders)
-        tag_row = ft.Row(
-            [
-                ft.Chip(
-                    label=ft.Text("All"), selected=not self.query, on_click=lambda _: self._set_query("")
-                ),
-                *[
-                    ft.Chip(
-                        label=ft.Text(f"#{t}"),
-                        selected=self.query == f"#{t}",
-                        on_click=lambda _, t=t: self._set_query(f"#{t}"),
-                    )
-                    for t in tags
-                ],
-            ],
-            wrap=True,
-            spacing=8,
-            visible=bool(tags),
-        )
-        groups = sections(reminders, now, self.query)
-        items: list[ft.Control] = []
-        for name, cards in groups:
-            colour = "#E11D48" if name == "Due now" else ft.Colors.ON_SURFACE_VARIANT
-            items.append(
+        self._render_tabs(reminders, now)
+        if self.settings_open:
+            items = self.settings_view()
+        elif self.tab == "today":
+            items = self.today_view(reminders, now)
+        elif self.tab == "upcoming":
+            items = self.upcoming_view(now)
+        elif self.tab == "all":
+            items = self.all_view(reminders, now)
+        else:
+            items = self.history_view(now)
+        self.body.controls = items
+        self._render_status(reminders, now)
+        self.page.update()
+
+    def _render_tabs(self, reminders: list[Reminder], now: datetime) -> None:
+        counts = {"today": len(today(reminders, now)), "all": sum(r.active for r in reminders)}
+        tabs: list[ft.Control] = []
+        for key, label in TABS:
+            selected = key == self.tab and not self.settings_open
+            row = [self.text(label, size=13, tone="text" if selected else "dim", weight="medium")]
+            if counts.get(key):
+                row.append(self.text(str(counts[key]), size=11, tone="accent" if selected else "faint",
+                                     mono=True))  # fmt: skip
+            tabs.append(
                 ft.Container(
-                    ft.Text(f"{name}  ·  {len(cards)}", size=13, weight=ft.FontWeight.W_600, color=colour),
-                    padding=ft.Padding.only(top=14, bottom=4, left=4),
+                    ft.Row(row, spacing=6, tight=True),
+                    padding=ft.Padding.symmetric(horizontal=10, vertical=5),
+                    border_radius=7,
+                    bgcolor=self.p.raised if selected else None,
+                    on_click=lambda _, k=key: self.set_tab(k),
                 )
             )
-            items += [self.card(c) for c in cards]
-        if not items:
-            items.append(self.empty_state(bool(self.query)))
-        return ft.Column(
-            [
-                self.header(f"{greeting(now)} 👋", subtitle, search, new_btn),
-                ft.Row(
-                    [
-                        self.stat("Due now", str(due_now), "#E11D48", ft.Icons.ALARM),
-                        self.stat("Today", str(st.due_today), "#F59E0B", ft.Icons.TODAY),
-                        self.stat("Done this week", str(st.done_7d), "#16A34A", ft.Icons.TASK_ALT),
-                        self.stat(
-                            "Best streak",
-                            f"{best} 🔥" if best else "0",
-                            "#6366F1",
-                            ft.Icons.LOCAL_FIRE_DEPARTMENT,
-                        ),  # fmt: skip
-                    ],
-                    spacing=12,
-                ),
-                tag_row,
-                ft.ListView(items, expand=True, spacing=8, padding=ft.Padding.only(bottom=24)),
-            ],
-            spacing=16,
-            expand=True,
+        if self.settings_open:
+            tabs.append(ft.Container(self.text("Settings", size=13, weight="medium"), bgcolor=self.p.raised,
+                                     padding=ft.Padding.symmetric(horizontal=10, vertical=5),
+                                     border_radius=7))  # fmt: skip
+        self.tabs.controls = tabs
+        self.filter_row.controls = (
+            [self.link(f"{self.query}  ×", self._clear_search, tone="accent", mono=True)]
+            if self.query
+            else []
         )
 
-    def empty_state(self, filtered: bool) -> ft.Control:
-        if filtered:
-            text, sub = "Nothing matches", "Try another search or tag."
-        else:
-            text, sub = (
-                "No reminders yet",
-                "Create your first one. You can type it like “Water plants every mon at 9”.",
-            )
+    def _clear_search(self) -> None:
+        self.input.value = ""
+        self._on_input()
+
+    def _render_status(self, reminders: list[Reminder], now: datetime) -> None:
+        if getattr(self, "_flashing", False):
+            return
+        due = sum(1 for r in reminders if r.active and not r.completed_at and r.effective_due <= now)
+        left = len(today(reminders, now)) - due
+        bits = []
+        if due:
+            bits.append(self.text(f"{due} due", size=12, tone="red", weight="medium"))
+        bits.append(self.text(f"{left} later today" if left else ("All caught up" if not due else ""),
+                              size=12, tone="dim"))  # fmt: skip
+        dot = ft.Container(width=6, height=6, border_radius=3,
+                           bgcolor=self.p.green if self.owns_runner else self.p.faint,
+                           tooltip="Sending notifications" if self.owns_runner
+                           else "nudge run is sending notifications")  # fmt: skip
+        self.status.controls = [dot, *bits]
+
+    def section_label(self, label: str, count: int | None = None, tone: str = "faint") -> ft.Control:
+        row = [self.text(label.upper(), size=10.5, tone=tone, weight="semi")]
+        if count is not None:
+            row.append(self.text(str(count), size=10.5, tone="faint", mono=True))
+        return ft.Container(ft.Row(row, spacing=6), padding=ft.Padding.only(left=12, top=16, bottom=6))
+
+    def empty(self, title: str, sub: str) -> ft.Control:
         return ft.Container(
             ft.Column(
                 [
-                    ft.Text("🔔", size=48),
-                    ft.Text(text, size=18, weight=ft.FontWeight.W_600),
-                    ft.Text(sub, color=ft.Colors.ON_SURFACE_VARIANT, text_align=ft.TextAlign.CENTER),
-                    ft.FilledButton(
-                        "New reminder",
-                        icon=ft.Icons.ADD,
-                        on_click=lambda _: self.open_form(),
-                        visible=not filtered,
-                    ),  # fmt: skip
+                    self.text(title, size=15, weight="medium"),
+                    self.text(sub, size=12.5, tone="dim", text_align=ft.TextAlign.CENTER),
                 ],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=8,
-            ),
+                spacing=6,
+            ),  # fmt: skip
             alignment=ft.Alignment.CENTER,
-            padding=60,
+            padding=ft.Padding.only(top=48, bottom=24, left=24, right=24),
         )
 
-    def card(self, c: Card) -> ft.Control:
-        chips: list[ft.Control] = [
-            ft.Container(ft.Text(f"#{t}", size=11, color=ACCENT), bgcolor=soft(ACCENT), border_radius=8,
-                         padding=ft.Padding.symmetric(horizontal=8, vertical=2))
-            for t in c.tags
-        ]  # fmt: skip
+    def today_view(self, reminders: list[Reminder], now: datetime) -> list[ft.Control]:
+        cards = today(reminders, now, self.query)
+        items: list[ft.Control] = []
+        due = [c for c in cards if c.state == "overdue"]
+        later = [c for c in cards if c.state != "overdue"]
+        if due:
+            items.append(self.section_label("Due now", len(due), tone="red"))
+            items += self.rows(due)
+        if later:
+            items.append(self.section_label("Later today", len(later)))
+            items += self.rows(later)
+        if not cards:
+            if not reminders:
+                return [self.empty("Nothing here yet",
+                                   "Type a reminder above and press Enter.\n"
+                                   "Take meds every day at 8am  ·  Stretch every 90 minutes  ·  "
+                                   "Pay rent monthly on the 1st")]  # fmt: skip
+            items.append(self.empty("Nothing left today", "Enjoy it."))
+            upcoming = next_up(reminders, now)
+            if upcoming and not self.query:
+                items.append(self.section_label("Next up"))
+                items += self.rows(upcoming)
+        return items
+
+    def all_view(self, reminders: list[Reminder], now: datetime) -> list[ft.Control]:
+        items: list[ft.Control] = []
+        for name, cards in sections(reminders, now, self.query):
+            items.append(self.section_label(name, len(cards), tone="red" if name == "Due now" else "faint"))
+            items += self.rows(cards)
+        if not items:
+            return [self.empty("Nothing matches", "Try another word or #tag.") if self.query else
+                    self.empty("No reminders yet", "Type one above and press Enter.")]  # fmt: skip
+        return items
+
+    def rows(self, cards: list[Card]) -> list[ft.Control]:
+        out: list[ft.Control] = []
+        for c in cards:
+            out.append(self.row(c))
+            if self.editor is not None and self.editor.rid == c.id:
+                out.append(self.editor.control)
+        return out
+
+    def row(self, c: Card) -> ft.Control:
+        tone = self.p.tone(c.tone)
+        check = ft.Container(
+            width=18,
+            height=18,
+            border_radius=9,
+            border=ft.Border.all(1.5, self.p.faint if c.active else self.p.line),
+            alignment=ft.Alignment.CENTER,
+            tooltip="Done",
+            on_click=(lambda _: self.act(c.id, "done")) if c.active else None,
+        )
+
+        def check_hover(e) -> None:
+            on = _hovering(e) and c.active
+            check.border = ft.Border.all(1.5, self.p.green if on else self.p.faint)
+            check.content = ft.Icon(ft.Icons.CHECK, size=12, color=self.p.green) if on else None
+            self._refresh(check)
+
+        check.on_hover = _safe(check_hover)
+
+        title: list[ft.Control] = []
         if c.priority >= 2:
-            pc = PRIORITY_COLOURS[c.priority]
-            chips.insert(0, ft.Container(ft.Text(c.priority_label.capitalize(), size=11, color=pc),
-                                         bgcolor=soft(pc), border_radius=8,
-                                         padding=ft.Padding.symmetric(horizontal=8, vertical=2)))  # fmt: skip
+            title.append(self.text("!!" if c.priority >= 3 else "!", size=14, mono=True, weight="medium",
+                                   tone="red" if c.priority >= 3 else "amber"))  # fmt: skip
+        title.append(self.text(c.title, size=14, weight="medium", tone="text" if c.active else "dim",
+                               max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, expand=True))  # fmt: skip
+        sub = [c.schedule, *[f"#{t}" for t in c.tags]]
         if c.streak >= 2:
-            chips.append(ft.Text(f"🔥 {c.streak}", size=12))
+            sub.append(f"{c.streak} in a row")
+        if c.state == "snoozed":
+            sub.insert(0, "Snoozed")
 
         snooze = ft.PopupMenuButton(
-            icon=ft.Icons.SNOOZE,
+            content=ft.Container(
+                ft.Icon(ft.Icons.BEDTIME_OUTLINED, size=15, color=self.p.dim),
+                width=28,
+                height=28,
+                alignment=ft.Alignment.CENTER,
+            ),  # fmt: skip
             tooltip="Snooze",
             items=[
                 ft.PopupMenuItem(content=label, on_click=lambda _, m=m: self.act(c.id, "snooze", m))
-                for m, label in [(10, "10 minutes"), (30, "30 minutes"), (60, "1 hour"), (180, "3 hours")]
-            ]
-            + [
-                ft.PopupMenuItem(
-                    content="Tomorrow morning", on_click=lambda _: self.act(c.id, "snooze", "tomorrow")
-                )
-            ],
-            disabled=not c.active,
-        )
-        more = ft.PopupMenuButton(
-            icon=ft.Icons.MORE_HORIZ,
-            tooltip="More",
-            items=[
-                ft.PopupMenuItem(
-                    content="Edit", icon=ft.Icons.EDIT_OUTLINED, on_click=lambda _: self.open_form(c.id)
-                ),
-                ft.PopupMenuItem(
-                    content="Skip this one",
-                    icon=ft.Icons.SKIP_NEXT,
-                    on_click=lambda _: self.act(c.id, "skip"),
-                ),
-                ft.PopupMenuItem(
-                    content="Back on schedule",
-                    icon=ft.Icons.RESTART_ALT,
-                    on_click=lambda _: self.act(c.id, "reset"),
-                ),
-                ft.PopupMenuItem(
-                    content="Resume" if not c.active else "Pause",
-                    icon=ft.Icons.PLAY_ARROW if not c.active else ft.Icons.PAUSE,
-                    on_click=lambda _: self.act(c.id, "resume" if not c.active else "pause"),
-                ),
-                ft.PopupMenuItem(),
-                ft.PopupMenuItem(
-                    content="Delete", icon=ft.Icons.DELETE_OUTLINE, on_click=lambda _: self.confirm_delete(c)
-                ),
+                for m, label in SNOOZES
             ],  # fmt: skip
+            menu_position=ft.PopupMenuPosition.UNDER,
+            border_radius=8,
         )
-        done = ft.IconButton(
-            icon=ft.Icons.CHECK_CIRCLE_OUTLINE,
-            selected_icon=ft.Icons.CHECK_CIRCLE,
-            icon_color="#16A34A",
-            icon_size=28,
-            tooltip="Mark done",
-            on_click=lambda _: self.act(c.id, "done"),
-            disabled=not c.active,
+        actions = ft.Row(
+            [
+                snooze,
+                self.icon_button(
+                    ft.Icons.SKIP_NEXT_OUTLINED, lambda: self.act(c.id, "skip"), "Skip this one"
+                ),
+            ]
+            if c.active
+            else [self.icon_button(ft.Icons.PLAY_ARROW_OUTLINED, lambda: self.act(c.id, "resume"), "Resume")],
+            spacing=0,
+            visible=False,
         )
-        overdue = c.state == "overdue"
-        return ft.Container(
+        editing = self.editor is not None and self.editor.rid == c.id
+        box = ft.Container(
             ft.Row(
                 [
-                    ft.Container(width=4, height=56, bgcolor=c.colour, border_radius=4),
-                    ft.Container(
-                        ft.Text(c.emoji, size=22),
-                        width=46,
-                        height=46,
-                        bgcolor=soft(c.colour),
-                        border_radius=23,
-                        alignment=ft.Alignment.CENTER,
-                    ),  # fmt: skip
+                    check,
                     ft.Column(
                         [
-                            ft.Text(
-                                c.title,
-                                size=16,
-                                weight=ft.FontWeight.W_600,
+                            ft.Row(title, spacing=6),
+                            self.text(
+                                "  ·  ".join(sub),
+                                size=12,
+                                tone="dim",
                                 max_lines=1,
                                 overflow=ft.TextOverflow.ELLIPSIS,
-                                opacity=0.55 if not c.active else 1,
                             ),  # fmt: skip
-                            ft.Row(
-                                [
-                                    ft.Icon(
-                                        ft.Icons.REPEAT if c.recurring else ft.Icons.EVENT,
-                                        size=14,
-                                        color=ft.Colors.ON_SURFACE_VARIANT,
-                                    ),
-                                    ft.Text(c.schedule, size=13, color=ft.Colors.ON_SURFACE_VARIANT),
-                                    *chips,
-                                ],
-                                spacing=6,
-                                wrap=True,
-                            ),  # fmt: skip
-                        ],
-                        spacing=4,
-                        expand=True,
-                    ),
-                    ft.Column(
-                        [
-                            ft.Text(c.when, size=14, weight=ft.FontWeight.W_600, color=c.colour),
-                            ft.Text(c.when_exact, size=11, color=ft.Colors.ON_SURFACE_VARIANT),
                         ],
                         spacing=2,
-                        horizontal_alignment=ft.CrossAxisAlignment.END,
+                        expand=True,
                     ),
-                    done,
-                    snooze,
-                    more,
+                    actions,
+                    ft.Container(
+                        ft.Text(c.right, size=13, color=tone, font_family="Mono Medium"), tooltip=c.when_exact
+                    ),  # fmt: skip
                 ],
                 spacing=14,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
-            padding=ft.Padding.only(left=0, right=8, top=10, bottom=10),
-            border_radius=14,
-            bgcolor=soft("#E11D48", 0.06) if overdue else ft.Colors.SURFACE_CONTAINER_LOW,
-            border=ft.Border.all(1, soft("#E11D48", 0.35)) if overdue else None,
-            on_click=lambda _: self.open_form(c.id),
-            ink=True,
+            padding=ft.Padding.symmetric(horizontal=12, vertical=9),
+            border_radius=9,
+            key=ft.ScrollKey(f"r{c.id}"),
+            bgcolor=self.p.raised if editing else None,
+            on_click=lambda _: self.toggle_editor(c.id),
         )
 
-    def _on_search(self, e) -> None:
-        self.query = e.control.value
+        def hover(e) -> None:
+            on = _hovering(e)
+            actions.visible = on
+            box.bgcolor = self.p.raised if on or editing else None
+            self._refresh(box)
+
+        box.on_hover = _safe(hover)
+        return box
+
+    def upcoming_view(self, now: datetime) -> list[ft.Control]:
+        items = self.service.agenda(now, now + timedelta(days=14))
+        counts: dict[tuple, int] = {}
+        for t, r in items:
+            counts[(t.date(), r.id)] = counts.get((t.date(), r.id), 0) + 1
+        out: list[ft.Control] = []
+        shown: set[tuple] = set()
+        current = None
+        for t, r in items:
+            if self.query and self.query.lstrip("#") not in (r.title.lower() + " " + " ".join(r.tag_list)):
+                continue
+            if t.date() != current:
+                current = t.date()
+                days = (current - now.date()).days
+                name = "Today" if days == 0 else ("Tomorrow" if days == 1 else t.strftime("%A"))
+                out.append(self.section_label(f"{name}  {t:%b} {t.day}"))
+            key = (t.date(), r.id)
+            n = counts[key]
+            if n > 4:
+                if key in shown:
+                    continue
+                shown.add(key)
+            right = f"{n}× · {r.schedule_label.lower()}" if n > 4 else " ".join("#" + x for x in r.tag_list)
+            out.append(
+                ft.Container(
+                    ft.Row(
+                        [
+                            ft.Container(
+                                self.text(
+                                    clock(t), size=12.5, mono=True, tone="red" if t <= now else "accent"
+                                ),
+                                width=74,
+                            ),  # fmt: skip
+                            self.text(
+                                r.title,
+                                size=13.5,
+                                expand=True,
+                                max_lines=1,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ),  # fmt: skip
+                            self.text(right, size=11.5, tone="faint", mono=True),
+                        ],
+                        spacing=10,
+                    ),
+                    padding=ft.Padding.symmetric(horizontal=12, vertical=6),
+                )
+            )
+        return out or [self.empty("Nothing in the next two weeks", "Reminders you add show up here by day.")]
+
+    def history_view(self, now: datetime) -> list[ft.Control]:
+        st = self.service.stats(now)
+        total = st.done_7d + st.missed_7d
+        rate = f"{st.done_7d / total * 100:.0f}%" if total else "–"
+        out: list[ft.Control] = [
+            ft.Container(
+                ft.Row(
+                    [
+                        self.stat(str(st.done_7d), "done", "green"),
+                        self.stat(str(st.missed_7d), "missed", "red"),
+                        self.stat(rate, "on time", "accent"),
+                        self.stat(str(max((b for _, b in st.best), default=0)), "best streak", "amber"),
+                    ],
+                    spacing=28,
+                ),  # fmt: skip
+                padding=ft.Padding.only(left=12, top=14, bottom=4),
+            ),
+            self.section_label("Last 7 days and earlier"),
+        ]
+        glyph = {"done": ("✓", "green", "Done"), "skipped": ("↷", "amber", "Skipped"),
+                 "missed": ("×", "red", "Missed")}  # fmt: skip
+        rows = 0
+        for c, r in self.service.history(limit=200):
+            if self.query and self.query.lstrip("#") not in (r.title.lower() + " " + " ".join(r.tag_list)):
+                continue
+            g, tone, label = glyph[c.status]
+            rows += 1
+            out.append(
+                ft.Container(
+                    ft.Row(
+                        [
+                            ft.Container(
+                                self.text(g, size=13, tone=tone, mono=True, weight="medium"), width=18
+                            ),
+                            self.text(
+                                r.title,
+                                size=13.5,
+                                expand=True,
+                                max_lines=1,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ),  # fmt: skip
+                            self.text(
+                                f"{label.lower()} · due {c.due_at:%b} {c.due_at.day} {clock(c.due_at)}",
+                                size=11.5,
+                                tone="faint",
+                                mono=True,
+                            ),  # fmt: skip
+                        ],
+                        spacing=10,
+                    ),
+                    padding=ft.Padding.symmetric(horizontal=12, vertical=6),
+                )
+            )
+        if not rows:
+            out.append(self.empty("No history yet", "What you finish, skip or miss shows up here."))
+        return out
+
+    def stat(self, value: str, label: str, tone: str) -> ft.Control:
+        return ft.Column([self.text(value, size=22, mono=True, tone=tone, weight="medium"),
+                          self.text(label, size=11, tone="dim")], spacing=0)  # fmt: skip
+
+    # ------------------------------------------------------------------ inline editor
+
+    def _exists(self, rid: int) -> bool:
+        try:
+            self.service.get(rid)
+            return True
+        except NotFound:
+            return False
+
+    def toggle_editor(self, rid: int) -> None:
+        if self.editor is not None and self.editor.rid == rid:
+            self.editor = None
+        else:
+            self.editor = InlineEditor(self, self.service.get(rid))
+        self.render()
+        if self.editor is not None:
+
+            async def reveal() -> None:
+                await asyncio.sleep(0.05)
+                await self.body.scroll_to(scroll_key=f"r{rid}", duration=250)
+
+            self.page.run_task(reveal)
+
+    def close_editor(self) -> None:
+        self.editor = None
         self.render()
 
-    def _set_query(self, q: str) -> None:
-        self.query = q
+    def save_edit(self, rid: int, **changes) -> bool:
+        try:
+            r = self.service.edit(rid, **changes)
+        except ScheduleError as e:
+            self.flash(str(e), warning=True)
+            return False
+        self.editor = None
         self.render()
+        self.flash(undo_message("edit", r.title), undo=True)
+        return True
+
+    def delete(self, rid: int) -> None:
+        r = self.service.delete(rid)
+        self.editor = None
+        self.render()
+        self.flash(f"Deleted {r.title}")
 
     # ------------------------------------------------------------------ actions
 
@@ -517,210 +879,61 @@ class NudgeWindow:
             else:
                 return
         except AlreadyDone as e:
-            self.toast(str(e), undo=True, warning=True)
+            self.flash(str(e).split(". ")[0], undo=True, warning=True)
             return
         except (NotFound, ScheduleError) as e:
-            self.toast(str(e), warning=True)
+            self.flash(str(e), warning=True)
             return
+        if self.editor is not None and self.editor.rid == rid:
+            self.editor = None
         self.render()
-        self.toast(undo_message(action, r.title), undo=True)
+        self.flash(undo_message(action, r.title), undo=True)
 
     def undo(self) -> None:
         try:
             action, r = self.service.undo()
         except NothingToUndo:
-            self.toast("Nothing to undo")
+            self.flash("Nothing to undo")
             return
+        self.editor = None
         self.render()
-        self.toast(f"Undid {action}: {r.title}")
+        self.flash(f"Undid {action}: {r.title}")
 
-    def toast(self, message: str, *, undo: bool = False, warning: bool = False) -> None:
-        bar = ft.SnackBar(
-            ft.Text(message),
-            action="Undo" if undo else None,
-            on_action=(lambda _: self.undo()) if undo else None,
-            behavior=ft.SnackBarBehavior.FLOATING,
-            width=520,
-            duration=ft.Duration(seconds=5),
-            bgcolor="#B45309" if warning else None,
-        )
-        self.page.show_dialog(bar)
+    def flash(self, message: str, *, undo: bool = False, warning: bool = False) -> None:
+        """Show a short message in the status bar (with Undo) for a few seconds."""
+        self.flash_token += 1
+        token = self.flash_token
+        self._flashing = True
+        self.last_flash = message
+        controls: list[ft.Control] = [
+            ft.Container(
+                width=6, height=6, border_radius=3, bgcolor=self.p.amber if warning else self.p.accent
+            ),
+            self.text(
+                message,
+                size=12,
+                tone="amber" if warning else "text",
+                max_lines=1,
+                overflow=ft.TextOverflow.ELLIPSIS,
+                expand=True,
+            ),  # fmt: skip
+        ]
+        if undo:
+            controls.append(self.link("Undo", self.undo, tone="accent"))
+        self.status.controls = controls
+        self.page.update()
 
-    def confirm_delete(self, c: Card) -> None:
-        def yes(_):
-            self.page.pop_dialog()
-            self.service.delete(c.id)
-            self.render()
-            self.toast(f"Deleted {c.title}")
+        async def clear() -> None:
+            await asyncio.sleep(6)
+            if token == self.flash_token:
+                self._flashing = False
+                self.render()
 
-        self.page.show_dialog(
-            ft.AlertDialog(
-                title=ft.Text(f"Delete “{c.title}”?"),
-                content=ft.Text("Its history goes too. This can't be undone."),
-                actions=[
-                    ft.TextButton("Cancel", on_click=lambda _: self.page.pop_dialog()),
-                    ft.FilledButton("Delete", on_click=yes, bgcolor="#E11D48"),
-                ],
-            )
-        )
+        self.page.run_task(clear)
 
-    # ------------------------------------------------------------------ new / edit form
+    # ------------------------------------------------------------------ settings
 
-    def open_form(self, rid: int | None = None) -> None:
-        existing = self.service.get(rid) if rid is not None else None
-        form = ReminderDialog(self, existing)
-        self.page.show_dialog(form.dialog)
-
-    def save_form(
-        self, rid: int | None, title: str, when: str, tags: list[str], priority: int, notes: str
-    ) -> bool:
-        try:
-            if rid is None:
-                r = self.service.add(title, when, tags=tags, priority=priority, notes=notes)
-                msg = f"Added {r.title} · {r.schedule_label}"
-            else:
-                old = self.service.get(rid)
-                r = self.service.edit(rid, title=title, when=when if when != old.when_text else None, tags=tags,
-                                      priority=priority, notes=notes)  # fmt: skip
-                msg = f"Updated {r.title}"
-        except ScheduleError as e:
-            self.toast(str(e), warning=True)
-            return False
-        self.page.pop_dialog()  # close the form before showing the confirmation
-        self.render()
-        self.toast(msg, undo=rid is not None)
-        return True
-
-    # ------------------------------------------------------------------ other views
-
-    def upcoming_view(self) -> ft.Control:
-        now = _now()
-        items = self.service.agenda(now, now + timedelta(days=14))
-        rows: list[ft.Control] = []
-        current = None
-        counts: dict[tuple, int] = {}
-        for t, r in items:
-            counts[(t.date(), r.id)] = counts.get((t.date(), r.id), 0) + 1
-        shown: set[tuple] = set()
-        for t, r in items:
-            if t.date() != current:
-                current = t.date()
-                label = "Today" if current == now.date() else (
-                    "Tomorrow" if current == now.date() + timedelta(days=1) else t.strftime("%A"))  # fmt: skip
-                rows.append(
-                    ft.Container(
-                        ft.Row(
-                            [
-                                ft.Text(label, size=15, weight=ft.FontWeight.W_700),
-                                ft.Text(t.strftime("%b %d"), color=ft.Colors.ON_SURFACE_VARIANT),
-                            ]
-                        ),  # fmt: skip
-                        padding=ft.Padding.only(top=16, bottom=4),
-                    )
-                )
-            key = (t.date(), r.id)
-            n = counts[key]
-            if n > 4:
-                if key in shown:
-                    continue
-                shown.add(key)
-            extra = f"  ·  {n}× that day ({r.schedule_label.lower()})" if n > 4 else ""
-            colour = "#E11D48" if t <= now else ACCENT
-            rows.append(
-                ft.Container(
-                    ft.Row(
-                        [
-                            ft.Text(
-                                t.strftime("%I:%M %p").lstrip("0"),
-                                width=80,
-                                color=colour,
-                                weight=ft.FontWeight.W_600,
-                            ),  # fmt: skip
-                            ft.Text(f"{r.title}{extra}", expand=True),
-                            ft.Text(" ".join("#" + x for x in r.tag_list), color=ACCENT, size=12),
-                        ]
-                    ),
-                    padding=ft.Padding.symmetric(horizontal=14, vertical=10),
-                    border_radius=10,
-                    bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
-                )
-            )
-        if not rows:
-            rows.append(
-                ft.Text("Nothing scheduled in the next two weeks.", color=ft.Colors.ON_SURFACE_VARIANT)
-            )
-        return ft.Column(
-            [self.header("Upcoming", "Everything due in the next two weeks"),
-             ft.ListView(rows, expand=True, spacing=6)],
-            expand=True,
-            spacing=12,
-        )  # fmt: skip
-
-    def history_view(self) -> ft.Control:
-        rows: list[ft.Control] = []
-        style = {"done": ("✓", "#16A34A", "Done"), "skipped": ("↷", "#F59E0B", "Skipped"),
-                 "missed": ("✗", "#E11D48", "Missed")}  # fmt: skip
-        for c, r in self.service.history(limit=200):
-            icon, colour, label = style[c.status]
-            rows.append(
-                ft.Container(
-                    ft.Row(
-                        [
-                            ft.Container(
-                                ft.Text(icon, color=colour, weight=ft.FontWeight.W_700),
-                                width=32,
-                                height=32,
-                                border_radius=16,
-                                bgcolor=soft(colour),
-                                alignment=ft.Alignment.CENTER,
-                            ),  # fmt: skip
-                            ft.Column(
-                                [
-                                    ft.Text(r.title, weight=ft.FontWeight.W_600),
-                                    ft.Text(
-                                        f"{label} · was due {c.due_at:%a %b %d %H:%M}",
-                                        size=12,
-                                        color=ft.Colors.ON_SURFACE_VARIANT,
-                                    ),
-                                ],
-                                spacing=0,
-                                expand=True,
-                            ),
-                            ft.Text(
-                                c.at.strftime("%b %d, %H:%M"), color=ft.Colors.ON_SURFACE_VARIANT, size=12
-                            ),
-                        ],  # fmt: skip
-                        spacing=12,
-                    ),
-                    padding=ft.Padding.symmetric(horizontal=14, vertical=8),
-                    border_radius=10,
-                    bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
-                )
-            )
-        if not rows:
-            rows.append(ft.Text("Nothing yet. Things you finish, skip or miss show up here.",
-                                color=ft.Colors.ON_SURFACE_VARIANT))  # fmt: skip
-        st = self.service.stats(_now())
-        total = st.done_7d + st.missed_7d
-        rate = f"{st.done_7d / total * 100:.0f}%" if total else "—"
-        return ft.Column(
-            [
-                self.header("History", "What you did, skipped and missed"),
-                ft.Row(
-                    [
-                        self.stat("Done (7 days)", str(st.done_7d), "#16A34A", ft.Icons.TASK_ALT),
-                        self.stat("Missed (7 days)", str(st.missed_7d), "#E11D48", ft.Icons.ALARM_OFF),
-                        self.stat("On-time rate", rate, ACCENT, ft.Icons.INSIGHTS),
-                    ],
-                    spacing=12,
-                ),  # fmt: skip
-                ft.ListView(rows, expand=True, spacing=6),
-            ],
-            expand=True,
-            spacing=16,
-        )
-
-    def settings_view(self) -> ft.Control:
+    def settings_view(self) -> list[ft.Control]:
         st = Settings.load()
 
         def save(key: str, value) -> None:
@@ -728,104 +941,129 @@ class NudgeWindow:
             try:
                 s.set(key, str(value))
             except (KeyError, ValueError) as e:
-                self.toast(str(e), warning=True)
+                self.flash(str(e), warning=True)
                 return
             s.save()
-            self.toast("Saved")
+            if key == "theme":
+                self.build()
+            self.flash("Saved")
 
-        def number(label: str, key: str, help_text: str) -> ft.Control:
-            return ft.TextField(label=label, value=str(getattr(st, key)), width=200, helper=help_text,
-                                keyboard_type=ft.KeyboardType.NUMBER,
-                                on_blur=lambda e: save(key, e.control.value),
-                                on_submit=lambda e: save(key, e.control.value))  # fmt: skip
-
-        def group(title: str, *controls: ft.Control) -> ft.Control:
-            return ft.Container(
-                ft.Column([ft.Text(title, size=16, weight=ft.FontWeight.W_700), *controls], spacing=14),
-                padding=20,
-                border_radius=14,
-                bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
+        def field(key: str, width: int = 56, hint: str = "") -> ft.Control:
+            return ft.TextField(
+                value=str(getattr(st, key)),
+                hint_text=hint,
+                width=width,
+                text_align=ft.TextAlign.RIGHT,
+                border=_no_border(),
+                filled=True,
+                bgcolor=self.p.surface,
+                border_radius=6,
+                dense=True,
+                content_padding=ft.Padding.symmetric(horizontal=8, vertical=6),
+                text_style=ft.TextStyle(size=13, color=self.p.accent, font_family="Mono"),
+                hint_style=ft.TextStyle(size=13, color=self.p.faint, font_family="Mono"),
+                cursor_color=self.p.accent,
+                on_blur=lambda e: save(key, e.control.value),
+                on_submit=lambda e: save(key, e.control.value),
             )
 
-        startup_row: list[ft.Control] = []
+        def switch(key: str, value: bool, on_change: Callable | None = None) -> ft.Control:
+            return ft.Switch(value=value, active_color=self.p.bg, active_track_color=self.p.accent,
+                             inactive_track_color=self.p.raised, inactive_thumb_color=self.p.dim,
+                             track_outline_color=ft.Colors.TRANSPARENT, scale=0.8,
+                             on_change=on_change or (lambda e: save(key, e.control.value)))  # fmt: skip
+
+        def pills(key: str, current: str, options: list[tuple[str, str]]) -> ft.Control:
+            return ft.Container(
+                ft.Row(
+                    [
+                        ft.Container(
+                            self.text(
+                                label, size=12, weight="medium", tone="text" if value == current else "dim"
+                            ),
+                            bgcolor=self.p.raised if value == current else None,
+                            border_radius=5,
+                            padding=ft.Padding.symmetric(horizontal=10, vertical=4),
+                            on_click=lambda _, v=value: save(key, v),
+                        )
+                        for value, label in options
+                    ],
+                    spacing=2,
+                    tight=True,
+                ),  # fmt: skip
+                bgcolor=self.p.surface,
+                border_radius=7,
+                padding=2,
+            )
+
+        def unit(label: str) -> ft.Control:
+            return ft.Container(self.text(label, size=12, tone="dim"), width=36)
+
+        def line(label: str, control: ft.Control, sub: str = "") -> ft.Control:
+            left: list[ft.Control] = [self.text(label, size=13.5)]
+            if sub:
+                left.append(self.text(sub, size=11.5, tone="dim"))
+            return ft.Container(
+                ft.Row(
+                    [ft.Column(left, spacing=1, expand=True), control],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),  # fmt: skip
+                padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+            )
+
         try:
             from .. import startup
 
-            current = startup.status()
-            startup_row.append(
-                ft.Switch(
-                    label="Start Nudge when I sign in to Windows",
-                    value=current is not None,
-                    on_change=lambda e: self._toggle_startup(e.control.value),
-                )  # fmt: skip
-            )
+            startup_ctrl: ft.Control = switch("", startup.status() is not None,
+                                              lambda e: self._toggle_startup(e.control.value))  # fmt: skip
         except RuntimeError:
-            startup_row.append(ft.Text("Starting at sign-in is available on Windows.",
-                                       color=ft.Colors.ON_SURFACE_VARIANT))  # fmt: skip
+            startup_ctrl = self.text("Windows only", size=12, tone="faint")
 
-        runner = (
-            "This window is sending your notifications."
-            if self.owns_runner
-            else "Another Nudge (nudge run) is already sending notifications."
-        )
-        return ft.Column(
-            [
-                self.header("Settings", "Changes apply right away"),
-                ft.ListView(
+        return [
+            self.section_label("Appearance"),
+            line(
+                "Theme",
+                pills("theme", st.theme, [("system", "System"), ("dark", "Dark"), ("light", "Light")]),
+            ),
+            self.section_label("Notifications"),
+            line("Sound", switch("sound", st.sound)),
+            line(
+                "Remind again every",
+                ft.Row([field("nag_minutes"), unit("min")], tight=True),
+                "0 = only once",
+            ),  # fmt: skip
+            line(
+                "Stop after",
+                ft.Row([field("max_nags"), unit("times")], tight=True),
+                "0 = keep going",
+            ),  # fmt: skip
+            line(
+                "Default snooze",
+                ft.Row([field("snooze_minutes"), unit("min")], tight=True),
+            ),  # fmt: skip
+            line(
+                "Quiet hours",
+                ft.Row(
                     [
-                        group(
-                            "Notifications",
-                            ft.Switch(
-                                label="Play a sound",
-                                value=st.sound,
-                                on_change=lambda e: save("sound", e.control.value),
-                            ),
-                            ft.Row(
-                                [
-                                    number("Remind again every (min)", "nag_minutes", "0 = only once"),
-                                    number("Stop after (times)", "max_nags", "0 = keep going"),
-                                    number("Default snooze (min)", "snooze_minutes", ""),
-                                ],
-                                spacing=16,
-                                wrap=True,
-                            ),
-                            ft.Text(runner, size=12, color=ft.Colors.ON_SURFACE_VARIANT),
-                        ),  # fmt: skip
-                        group(
-                            "Quiet hours",
-                            ft.Text(
-                                "No notifications in this window except urgent ones. Leave blank to turn off.",
-                                color=ft.Colors.ON_SURFACE_VARIANT,
-                            ),
-                            ft.Row(
-                                [
-                                    ft.TextField(
-                                        label="From",
-                                        value=st.quiet_start,
-                                        width=140,
-                                        hint_text="22:00",
-                                        on_blur=lambda e: save("quiet_start", e.control.value),
-                                    ),
-                                    ft.TextField(
-                                        label="Until",
-                                        value=st.quiet_end,
-                                        width=140,
-                                        hint_text="07:00",
-                                        on_blur=lambda e: save("quiet_end", e.control.value),
-                                    ),
-                                ],
-                                spacing=16,
-                            ),
-                        ),  # fmt: skip
-                        group("Startup", *startup_row),
+                        field("quiet_start", 70, "22:00"),
+                        self.text("to", size=12, tone="dim"),
+                        field("quiet_end", 70, "07:00"),
                     ],
-                    spacing=14,
-                    expand=True,
+                    tight=True,
                 ),
-            ],
-            expand=True,
-            spacing=16,
-        )
+                "Only urgent reminders get through. Clear both to turn off.",
+            ),  # fmt: skip
+            self.section_label("System"),
+            line("Open Nudge when I sign in", startup_ctrl, "Lives in the tray and keeps reminding you"),
+            line(
+                "Notifications",
+                self.text("this window" if self.owns_runner else "nudge run", size=12, tone="dim", mono=True),
+                "Who is sending them right now",
+            ),  # fmt: skip
+            line(
+                "Version", self.text(f"nudge {__version__}", size=12, tone="dim", mono=True), str(data_dir())
+            ),
+        ]
 
     def _toggle_startup(self, on: bool) -> None:
         from .. import startup
@@ -833,196 +1071,172 @@ class NudgeWindow:
         try:
             if on:
                 startup.install(app=True)
-                self.toast("Nudge will open in the tray when you sign in")
+                self.flash("Nudge will open in the tray when you sign in")
             else:
                 startup.uninstall()
-                self.toast("Nudge won't start at sign-in")
+                self.flash("Nudge won't start at sign-in")
         except Exception as e:
-            self.toast(f"Couldn't change startup: {e}", warning=True)
+            self.flash(f"Couldn't change startup: {e}", warning=True)
 
 
-class ReminderDialog:
-    """New / edit reminder: type it, or build it with the controls. The preview updates live."""
+class InlineEditor:
+    """Edit a reminder in place, under its row. The schedule is checked as you type."""
 
-    def __init__(self, app: NudgeWindow, existing=None):
+    def __init__(self, app: NudgeWindow, r: Reminder):
         self.app = app
-        self.rid = existing.id if existing else None
-        self.when = ""
-        tf = dict(border_radius=10, dense=True)
-        self.title = ft.TextField(label="What do you want to be reminded about?", value=existing.title if existing
-                                  else "", autofocus=True, on_change=self._title_changed, **tf)  # fmt: skip
-        self.quick = ft.TextField(
-            label="When (type it)",
-            value=(existing.when_text if existing else ""),
-            hint_text="e.g. every mon,thu at 9am · weekdays 8:30 · in 20 min",
-            prefix_icon=ft.Icons.AUTO_AWESOME,
-            on_change=lambda _: self.update(),
-            **tf,
-        )
-        self.repeat = ft.Dropdown(
-            label="Repeat",
-            value="daily",
-            options=[ft.DropdownOption(key=k, text=label) for k, label in REPEAT_CHOICES],
-            on_select=lambda _: self.update(),
-            width=280,
-            dense=True,
-            border_radius=10,
-        )
-        self.days = ft.SegmentedButton(
-            segments=[ft.Segment(value=d, label=ft.Text(d.capitalize())) for d in DAY_KEYS],
-            selected=[],
-            allow_multiple_selection=True,
-            allow_empty_selection=True,
-            show_selected_icon=False,
-            on_change=lambda _: self.update(),
-        )
-        self.every = ft.TextField(label="Every", value="2", width=90, keyboard_type=ft.KeyboardType.NUMBER,
-                                  on_change=lambda _: self.update(), **tf)  # fmt: skip
-        self.unit = ft.Dropdown(value="hours", options=[ft.DropdownOption(key="minutes", text="minutes"),
-                                                       ft.DropdownOption(key="hours", text="hours")],
-                                width=140, dense=True, border_radius=10,
-                                on_select=lambda _: self.update())  # fmt: skip
-        self.date = ft.TextField(label="Date", width=220, on_change=lambda _: self.update(), **tf)
-        self.times = ft.TextField(label="At", hint_text="9am · 8am, 8pm", width=220,
-                                  on_change=lambda _: self.update(), **tf)  # fmt: skip
-        self.priority = ft.SegmentedButton(
-            segments=[
-                ft.Segment(value=str(k), label=ft.Text(v.capitalize())) for k, v in PRIORITY_LABEL.items()
-            ],
-            selected=[str(existing.priority if existing else 1)],
-            show_selected_icon=False,
-        )
-        self.tags = ft.TextField(label="Tags", value=" ".join(existing.tag_list) if existing else "",
-                                 hint_text="home health", prefix_icon=ft.Icons.TAG, expand=True, **tf)  # fmt: skip
-        self.notes = ft.TextField(label="Notes (shown in the notification)", value=existing.notes if existing
-                                  else "", multiline=True, max_lines=3, **tf)  # fmt: skip
-        self.preview_title = ft.Text(weight=ft.FontWeight.W_600)
-        self.preview_body = ft.Text(size=13, color=ft.Colors.ON_SURFACE_VARIANT)
-        self.preview = ft.Container(
-            ft.Row(
+        self.rid = r.id
+        self.original_when = r.when_text
+        self.active = r.active
+        self.priority = r.priority
+        self.confirm_delete = False
+        p = app.p
+
+        def field(value: str, hint: str, *, size: float = 14, mono: bool = False, tone: str = "text",
+                  **kw) -> ft.TextField:  # fmt: skip
+            family = "Mono" if mono else "Inter"
+            return ft.TextField(
+                value=value,
+                hint_text=hint,
+                border=_no_border(),
+                dense=True,
+                content_padding=ft.Padding.symmetric(vertical=4),
+                text_style=ft.TextStyle(size=size, color=p.tone(tone), font_family=family),
+                hint_style=ft.TextStyle(size=size, color=p.faint, font_family=family),
+                cursor_color=p.accent,
+                **kw,
+            )
+
+        self.title = field(r.title, "Title", size=15, on_change=lambda _: self.check(), expand=True)
+        self.when = field(r.when_text, "When · every day at 9am", mono=True, size=13, tone="accent",
+                          on_change=lambda _: self.check(), expand=True)  # fmt: skip
+        self.when_result = app.text("", size=11.5, tone="dim", mono=True)
+        self.tags = field(" ".join(f"#{t}" for t in r.tag_list), "#tags", size=13, tone="dim", mono=True,
+                          expand=True)  # fmt: skip
+        self.notes = field(r.notes, "Notes · shown in the notification", size=13, tone="dim", multiline=True,
+                           min_lines=1, max_lines=3, expand=True)  # fmt: skip
+        self.priority_row = ft.Row(spacing=2, tight=True)
+        self.delete_link = ft.Container()
+        self.save_btn = ft.Container(app.text("Save", size=12.5, weight="semi", color=p.bg),
+                                     bgcolor=p.accent, border_radius=6,
+                                     padding=ft.Padding.symmetric(horizontal=14, vertical=6),
+                                     on_click=lambda _: self.save())  # fmt: skip
+
+        def label(text: str) -> ft.Control:
+            return ft.Container(app.text(text, size=11, tone="faint", mono=True), width=58)
+
+        self.control = ft.Container(
+            ft.Column(
                 [
-                    ft.Icon(ft.Icons.CHECK_CIRCLE, color="#16A34A"),
-                    ft.Column([self.preview_title, self.preview_body], spacing=2, expand=True),
-                ]
-            ),  # fmt: skip
-            padding=14,
-            border_radius=12,
-        )
-        self.builder_note = ft.Text("Or build it:", size=13, color=ft.Colors.ON_SURFACE_VARIANT)
-        self.builder = ft.Column(
-            [
-                ft.Row([self.repeat, self.every, self.unit], spacing=12, wrap=True),
-                self.days,
-                ft.Row([self.date, self.times], spacing=12, wrap=True),
-            ],
-            spacing=12,
-        )
-        self.save_btn = ft.FilledButton("Save" if existing else "Add reminder", icon=ft.Icons.CHECK,
-                                        on_click=self.save)  # fmt: skip
-        self.dialog = ft.AlertDialog(
-            title=ft.Text("Edit reminder" if existing else "New reminder", weight=ft.FontWeight.W_700),
-            content=ft.Container(
-                ft.Column(
-                    [
-                        self.title,
-                        self.quick,
-                        self.builder_note,
-                        self.builder,
-                        self.preview,
-                        ft.Text("Priority", size=13, color=ft.Colors.ON_SURFACE_VARIANT),
-                        self.priority,
-                        ft.Row([self.tags]),
-                        self.notes,
-                    ],
-                    spacing=14,
-                    scroll=ft.ScrollMode.AUTO,
-                    tight=True,
-                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                ),
-                width=600,
+                    ft.Row([label("title"), self.title], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ft.Row([label("when"), self.when], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ft.Row([label(""), self.when_result]),
+                    ft.Row([label("tags"), self.tags], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ft.Row([label("notes"), self.notes], vertical_alignment=ft.CrossAxisAlignment.START),
+                    ft.Row(
+                        [label("priority"), self.priority_row],
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Container(height=1, bgcolor=p.line, margin=ft.Margin.symmetric(vertical=4)),
+                    ft.Row(
+                        [
+                            ft.Row(
+                                [
+                                    app.link("Skip once", lambda: app.act(self.rid, "skip")),
+                                    app.link("Back on schedule", lambda: app.act(self.rid, "reset")),
+                                    app.link(
+                                        "Resume" if not self.active else "Pause",
+                                        lambda: app.act(self.rid, "resume" if not self.active else "pause"),
+                                    ),
+                                    self.delete_link,
+                                ],
+                                spacing=0,
+                                tight=True,
+                            ),
+                            ft.Row(
+                                [app.link("Cancel", app.close_editor), self.save_btn], spacing=4, tight=True
+                            ),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ],
+                spacing=4,
             ),
-            actions=[ft.TextButton("Cancel", on_click=lambda _: app.page.pop_dialog()), self.save_btn],
-            actions_alignment=ft.MainAxisAlignment.END,
-            scrollable=True,
+            bgcolor=p.surface,
+            border=ft.Border.all(1, p.line),
+            border_radius=10,
+            padding=ft.Padding.only(left=16, right=12, top=10, bottom=8),
+            margin=ft.Margin.only(left=8, right=8, top=2, bottom=8),
         )
-        self.update(initial=True)
+        self._draw_priority()
+        self._draw_delete()
+        self.check(initial=True)
 
-    # -------------------------------------------------------------- logic
+    def _draw_priority(self) -> None:
+        app, p = self.app, self.app.p
+        tones = {0: "dim", 1: "text", 2: "amber", 3: "red"}
+        self.priority_row.controls = [
+            ft.Container(
+                app.text(name, size=12, weight="medium", tone=tones[k] if k == self.priority else "faint"),
+                bgcolor=p.raised if k == self.priority else None,
+                border_radius=5,
+                padding=ft.Padding.symmetric(horizontal=9, vertical=3),
+                on_click=lambda _, k=k: self.set_priority(k),
+            )
+            for k, name in PRIORITY_LABEL.items()
+        ]
 
-    def schedule_text(self) -> str:
-        typed = (self.quick.value or "").strip()
-        if typed:
-            return typed
-        from_title = schedule_in_title(self.title.value or "")
-        if from_title:
-            return from_title[1]
-        return build_expression(
-            self.repeat.value or "daily",
-            times=self.times.value or "",
-            days=list(self.days.selected or []),
-            every=self.every.value or 1,
-            unit=self.unit.value or "hours",
-            date=self.date.value or "",
+    def set_priority(self, k: int) -> None:
+        self.priority = k
+        self._draw_priority()
+        self.app.page.update()
+
+    def _draw_delete(self) -> None:
+        self.delete_link.content = self.app.link(
+            "Click again to delete" if self.confirm_delete else "Delete", self.delete, tone="red"
         )
 
-    def update(self, initial: bool = False) -> None:
-        repeat = self.repeat.value or "daily"
-        shows = SHOWS.get(repeat, set())
-        in_title = not (self.quick.value or "").strip() and bool(schedule_in_title(self.title.value or ""))
-        typed = bool((self.quick.value or "").strip()) or in_title
-        self.days.visible = "days" in shows
-        self.every.visible = "every" in shows
-        self.unit.visible = "unit" in shows
-        self.date.visible = "date" in shows
-        self.date.hint_text = DATE_HINTS.get(repeat, "")
-        self.times.visible = "times" in shows
-        self.builder.opacity = 0.4 if typed else 1
-        self.builder.disabled = typed
-        if in_title:
-            self.builder_note.value = "Using the schedule in the title. Or set it here instead:"
-        elif typed:
-            self.builder_note.value = "Using what you typed. Clear it to build it instead:"
-        else:
-            self.builder_note.value = "Or build it:"
+    def delete(self) -> None:
+        if not self.confirm_delete:
+            self.confirm_delete = True
+            self._draw_delete()
+            self.app.page.update()
+            return
+        self.app.delete(self.rid)
+
+    def check(self, initial: bool = False) -> bool:
+        when = (self.when.value or "").strip()
+        ok = bool(extract_inline_meta(self.title.value or "").title)
         try:
-            when = self.schedule_text()
-            sched, times = explain(when, _now(), 3)
+            sched, times = explain(when, _now(), 1)
         except (ScheduleError, ValueError) as e:
-            self.when = ""
-            self.preview.bgcolor = soft("#E11D48", 0.1)
-            self.preview.content.controls[0] = ft.Icon(ft.Icons.ERROR_OUTLINE, color="#E11D48")
-            self.preview_title.value = str(e)
-            self.preview_body.value = "Try: " + " · ".join(EXAMPLES[:4])
+            self.when_result.value = str(e).split(". ")[0][:48]
+            self.when_result.color = self.app.p.red
+            ok = False
         else:
-            self.when = when
-            self.preview.bgcolor = soft("#16A34A", 0.1)
-            self.preview.content.controls[0] = ft.Icon(ft.Icons.CHECK_CIRCLE, color="#16A34A")
-            self.preview_title.value = sched.label
-            nxt = "  ·  ".join(t.strftime("%a %b %d, %I:%M %p").replace(" 0", " ") for t in times)
-            understood = ""
-            if sched.understood and sched.understood != " ".join(when.lower().split()):
-                understood = f"\nUnderstood as “{sched.understood}”"
-            self.preview_body.value = f"Next: {nxt}{understood}"
-        self.save_btn.disabled = not self.when or not extract_inline_meta(self.title.value or "").title
+            self.when_result.value = f"{sched.label} · next {times[0]:%a} {clock(times[0])}"
+            self.when_result.color = self.app.p.dim
+        self.save_btn.opacity = 1 if ok else 0.4
+        self.save_btn.disabled = not ok
         if not initial:
             self.app.page.update()
+        return ok
 
-    def _title_changed(self, _e) -> None:
-        self.update()
-
-    def save(self, _=None) -> None:
-        title = self.title.value or ""
-        if not (self.quick.value or "").strip():
-            from_title = schedule_in_title(title)
-            if from_title:
-                title = from_title[0]
-        meta = extract_inline_meta(title)
-        if not meta.title or not self.when:
-            return
+    def save(self) -> bool:
+        if not self.check(initial=True):
+            self.app.page.update()
+            return False
+        meta = extract_inline_meta(self.title.value or "")
         tags = [t.lstrip("#") for t in (self.tags.value or "").replace(",", " ").split()] + meta.tags
-        selected = list(self.priority.selected or ["1"])
-        priority = meta.priority if meta.priority is not None else int(selected[0])
-        self.app.save_form(self.rid, meta.title, self.when, tags, priority, (self.notes.value or "").strip())
+        when = (self.when.value or "").strip()
+        return self.app.save_edit(
+            self.rid,
+            title=meta.title,
+            when=when if when != self.original_when else None,
+            tags=tags,
+            priority=meta.priority if meta.priority is not None else self.priority,
+            notes=(self.notes.value or "").strip(),
+        )
 
 
 def run(*, minimized: bool = False, web_port: int | None = None) -> None:

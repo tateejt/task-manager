@@ -14,10 +14,12 @@ nudge run          # or: nudge startup install
 
 ## Features
 
-- **Desktop app**: on Windows, `nudge` (or the Start-menu shortcut from `nudge shortcut`) opens a clickable
-  window. It has your reminders grouped by Due now, Later today, Tomorrow and so on, with one-click Done, Snooze and
-  Undo, search and tag filters, an Upcoming calendar, History, and Settings. Closing the window keeps Nudge in the
-  tray, where it keeps sending notifications. The terminal dashboard is still available with `nudge tui`.
+- **Desktop app**: on Windows, `nudge` (or the Start-menu shortcut from `nudge shortcut`) opens a small, quiet
+  window in a dark (or light) macOS-style look. Type a reminder in plain English in the top line and Nudge shows
+  what it understood on the right as you type, like a calculator; press Enter to add it. Below is a plain list
+  (Today, Upcoming, All, History) with one-click Done, Snooze and Skip, and clicking a row edits it in place.
+  `Ctrl+K` new, `Ctrl+Z` undo, `/word` or `#tag` to search. Closing the window keeps Nudge in the tray, where it
+  keeps sending notifications. The terminal dashboard is still available with `nudge tui`.
 - **No exact wording needed**: typos and casual phrasing work (`evry thrusday 9.30am`, `mondays and fridays at 6`,
   `twice a day`, `everyday at 8`). Nudge always shows what it understood and the next few times before saving.
 - **Guided form**: press `a` in the dashboard to pick the repeat pattern, days and times from a form, with a live
@@ -54,6 +56,12 @@ nudge shortcut           # add Nudge to the Start menu and desktop
 nudge startup install    # open Nudge in the tray every time you sign in
 nudge                    # open the app
 ```
+
+### Updating
+
+After you download a new zip and replace the files, the `nudge` command still runs the old copy until you
+reinstall it. Quit Nudge from its tray icon, then double-click **`update.cmd`** in the folder (or run
+`uv tool install --reinstall .` there). `nudge --version` shows which version you're on.
 
 For development: `uv sync`, then `uv run pytest` and `uv run nudge ...`.
 
@@ -109,6 +117,7 @@ For development: `uv sync`, then `uv run pytest` and `uv run nudge ...`.
 | `quiet_bypass_priority` | 3 | Priority that still alerts in quiet hours (3 = urgent) |
 | `poll_seconds` | 20 | How often the runner checks |
 | `sound` | true | Play a sound |
+| `theme` | system | Desktop app look: system, dark or light |
 
 Data lives in `%LOCALAPPDATA%\nudge` (`nudge config show` prints the folder). Set `NUDGE_HOME` to use another.
 
@@ -122,8 +131,8 @@ src/nudge/
   runner.py     the background loop; toast button clicks come back through a queue
   notify.py     notification content + Windows toasts (windows-toasts), console fallback elsewhere
   forms.py      the guided new/edit form with live preview (Textual)
-  gui/          the desktop window (Flet): app.py views + tray, presenter.py display logic
-  assets/       notification icons (regenerate with tools/make_icons.py)
+  gui/          the desktop window (Flet): app.py window + tray, presenter.py display logic, theme.py
+  assets/       notification icons (tools/make_icons.py) and fonts (Inter, JetBrains Mono; OFL)
   startup.py    HKCU Run key so the runner starts at sign-in via pythonw (no window)
   cli.py        Typer + Rich commands
   tui.py        Textual dashboard

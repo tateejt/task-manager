@@ -46,6 +46,8 @@ class Settings:
     poll_seconds: int = 20
     #: Play a sound with toasts.
     sound: bool = True
+    #: Desktop app appearance: system, dark or light.
+    theme: str = "system"
 
     @classmethod
     def load(cls) -> Settings:
@@ -75,6 +77,8 @@ class Settings:
             parsed = value.strip()
             if key.startswith("quiet_") and parsed:
                 _parse_hhmm(str(parsed))
+            if key == "theme" and parsed not in ("system", "dark", "light"):
+                raise ValueError("theme must be system, dark or light")
         setattr(self, key, parsed)
 
     def in_quiet_hours(self, moment: datetime) -> bool:
