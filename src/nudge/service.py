@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import event
 from sqlmodel import Session, SQLModel, col, create_engine, select
 
 from .config import Settings, db_path
-from .models import Completion, Reminder
+from .models import Completion, Reminder, UndoEntry
 from .schedule import (
     ScheduleError,
     extract_inline_meta,
@@ -30,6 +32,42 @@ def _now() -> datetime:
 
 class NotFound(LookupError):
     pass
+
+
+class AlreadyDone(ValueError):
+    """Raised when Done/Skip is pressed again for an occurrence that's already handled."""
+
+    def __init__(self, reminder: Reminder):
+        self.reminder = reminder
+        super().__init__(
+            f"'{reminder.title}' is already done for now. The next one is "
+            f"{reminder.due_at:%a %b %d %H:%M}. Use undo if that was a mistake."
+        )
+
+
+class NothingToUndo(LookupError):
+    pass
+
+
+#: Fields an action can change, and therefore what undo restores.
+_UNDO_FIELDS = (
+    "due_at", "snoozed_until", "last_notified_at", "notify_count", "active", "completed_at",
+    "streak", "best_streak", "title", "notes", "rule", "when_text", "schedule_label", "priority", "tags",
+)  # fmt: skip
+_DT_FIELDS = {"due_at", "snoozed_until", "last_notified_at", "completed_at"}
+
+
+def _snapshot(r: Reminder) -> str:
+    data = {}
+    for f in _UNDO_FIELDS:
+        v = getattr(r, f)
+        data[f] = v.isoformat() if isinstance(v, datetime) else v
+    return json.dumps(data)
+
+
+def _restore(r: Reminder, state: str) -> None:
+    for f, v in json.loads(state).items():
+        setattr(r, f, datetime.fromisoformat(v) if f in _DT_FIELDS and v else v)
 
 
 @dataclass
@@ -134,6 +172,9 @@ class ReminderService:
     ) -> Reminder:
         now = now or _now()
         r = self.get(rid)
+        with self.session() as s:
+            self._record(s, r, "edit", now)
+            s.commit()
         if title:
             r.title = title
         if notes is not None:
@@ -155,8 +196,8 @@ class ReminderService:
             r = s.get(Reminder, rid)
             if r is None:
                 raise NotFound(f"No reminder with id {rid}.")
-            for c in s.exec(select(Completion).where(Completion.reminder_id == rid)):
-                s.delete(c)
+            s.exec(sa_delete(Completion).where(Completion.reminder_id == rid))
+            s.exec(sa_delete(UndoEntry).where(UndoEntry.reminder_id == rid))
             s.delete(r)
             s.commit()
             return r
@@ -164,6 +205,9 @@ class ReminderService:
     def set_active(self, rid: int, active: bool, now: datetime | None = None) -> Reminder:
         now = now or _now()
         r = self.get(rid)
+        with self.session() as s:
+            self._record(s, r, "resume" if active else "pause", now)
+            s.commit()
         r.active = active
         if active and r.recurring and r.due_at < now:
             # Resuming after a break shouldn't flood you with old occurrences.
@@ -254,7 +298,32 @@ class ReminderService:
         else:
             r.completed_at = now
 
-    def complete(self, rid: int, now: datetime | None = None) -> Reminder:
+    def _record(self, s: Session, r: Reminder, action: str, now: datetime, completion_id=None) -> None:
+        s.add(
+            UndoEntry(
+                reminder_id=r.id, action=action, at=now, state=_snapshot(r), completion_id=completion_id
+            )
+        )
+
+    def _already_handled(self, s: Session, r: Reminder, now: datetime) -> bool:
+        """True when the current occurrence was already done/skipped and the next isn't due yet.
+
+        Completing *early* once is fine (e.g. ticking off tonight's task this afternoon), but a
+        second press would silently eat the following occurrence too, so it's refused.
+        """
+        if not r.rule or r.due_at <= now:
+            return False
+        last = s.exec(
+            select(Completion)
+            .where(Completion.reminder_id == r.id, col(Completion.status).in_(["done", "skipped"]))
+            .order_by(col(Completion.id).desc())
+        ).first()
+        if last is None:
+            return False
+        started = latest_occurrence(r.rule, now)
+        return started is None or last.at >= started
+
+    def _finish_occurrence(self, rid: int, status: str, now: datetime | None, force: bool) -> Reminder:
         now = now or _now()
         with self.session() as s:
             r = s.get(Reminder, rid)
@@ -262,24 +331,38 @@ class ReminderService:
                 raise NotFound(f"No reminder with id {rid}.")
             if r.completed_at:
                 return r
-            self._log(s, r, "done", now)
-            r.streak += 1
-            r.best_streak = max(r.best_streak, r.streak)
+            if not force and self._already_handled(s, r, now):
+                raise AlreadyDone(r)
+            before = _snapshot(r)
+            c = Completion(reminder_id=r.id, due_at=r.due_at, at=now, status=status)
+            s.add(c)
+            s.flush()
+            s.add(UndoEntry(reminder_id=r.id, action="done" if status == "done" else "skip", at=now,
+                            state=before, completion_id=c.id))  # fmt: skip
+            if status == "done":
+                r.streak += 1
+                r.best_streak = max(r.best_streak, r.streak)
             self._advance(r, now)
             s.add(r)
             s.commit()
             s.refresh(r)
             return r
 
-    def skip(self, rid: int, now: datetime | None = None) -> Reminder:
+    def complete(self, rid: int, now: datetime | None = None, force: bool = False) -> Reminder:
+        """Mark the current occurrence done. ``force`` allows completing further ahead."""
+        return self._finish_occurrence(rid, "done", now, force)
+
+    def skip(self, rid: int, now: datetime | None = None, force: bool = False) -> Reminder:
         """Skip this occurrence without breaking the streak."""
-        now = now or _now()
+        return self._finish_occurrence(rid, "skipped", now, force)
+
+    def _mutate(self, rid: int, action: str, now: datetime, fn) -> Reminder:
         with self.session() as s:
             r = s.get(Reminder, rid)
             if r is None:
                 raise NotFound(f"No reminder with id {rid}.")
-            self._log(s, r, "skipped", now)
-            self._advance(r, now)
+            self._record(s, r, action, now)
+            fn(r)
             s.add(r)
             s.commit()
             s.refresh(r)
@@ -288,11 +371,62 @@ class ReminderService:
     def snooze(self, rid: int, minutes: int | None = None, now: datetime | None = None) -> Reminder:
         now = now or _now()
         minutes = minutes or Settings.load().snooze_minutes
-        r = self.get(rid)
-        # Snoozing something not yet due pushes it back from when it was going to fire.
-        r.snoozed_until = max(now, r.effective_due) + timedelta(minutes=minutes)
-        r.last_notified_at = None
-        return self._save(r)
+
+        def apply(r: Reminder) -> None:
+            # Snoozing something not yet due pushes it back from when it was going to fire.
+            r.snoozed_until = max(now, r.effective_due) + timedelta(minutes=minutes)
+            r.last_notified_at = None
+
+        return self._mutate(rid, "snooze", now, apply)
+
+    def reset(self, rid: int, now: datetime | None = None) -> Reminder:
+        """Put a reminder back on its schedule: the next occurrence from now, no snooze, no nags.
+
+        A finished one-off whose time hasn't passed yet is reopened.
+        """
+        now = now or _now()
+
+        def apply(r: Reminder) -> None:
+            if r.rule:
+                nxt = next_occurrence(r.rule, now - timedelta(seconds=1))
+                if nxt is None:
+                    raise ScheduleError("That schedule has no more occurrences.")
+                r.due_at = nxt
+                r.completed_at = None
+            elif r.completed_at and r.due_at > now:
+                r.completed_at = None
+            r.snoozed_until = r.last_notified_at = None
+            r.notify_count = 0
+
+        return self._mutate(rid, "reset", now, apply)
+
+    def undo(self, rid: int | None = None) -> tuple[str, Reminder]:
+        """Undo the most recent action (optionally for one reminder). Returns (action, reminder)."""
+        with self.session() as s:
+            q = select(UndoEntry).order_by(col(UndoEntry.id).desc())
+            if rid is not None:
+                q = q.where(UndoEntry.reminder_id == rid)
+            entry = s.exec(q).first()
+            if entry is None:
+                raise NothingToUndo("Nothing to undo.")
+            r = s.get(Reminder, entry.reminder_id)
+            _restore(r, entry.state)
+            if entry.completion_id:
+                c = s.get(Completion, entry.completion_id)
+                if c:
+                    s.delete(c)
+            s.delete(entry)
+            s.add(r)
+            s.commit()
+            s.refresh(r)
+            return entry.action, r
+
+    def last_undoable(self) -> tuple[str, Reminder] | None:
+        with self.session() as s:
+            entry = s.exec(select(UndoEntry).order_by(col(UndoEntry.id).desc())).first()
+            if entry is None:
+                return None
+            return entry.action, s.get(Reminder, entry.reminder_id)
 
     # ------------------------------------------------------------------ the scheduler's view
 

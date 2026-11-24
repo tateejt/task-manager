@@ -13,7 +13,7 @@ from rich.console import Console
 
 from .config import Settings, data_dir
 from .notify import Action, Notifier, make_notifier
-from .service import NotFound, ReminderService
+from .service import AlreadyDone, NotFound, ReminderService
 
 
 def apply_action(service: ReminderService, action: Action, now: datetime | None = None) -> str:
@@ -29,6 +29,8 @@ def apply_action(service: ReminderService, action: Action, now: datetime | None 
             return f"Snoozed: {r.title} until {r.snoozed_until:%H:%M}"
     except NotFound:
         return f"Reminder {action.reminder_id} no longer exists"
+    except AlreadyDone as e:
+        return str(e)
     return f"Unknown action {action.kind}"
 
 

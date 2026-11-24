@@ -8,8 +8,9 @@ purpose: "every day at 9am" must stay 9am across daylight-saving changes.
 
 from __future__ import annotations
 
+import difflib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta
 
 import dateparser
@@ -60,6 +61,8 @@ class Schedule:
     due: datetime
     rule: str | None = None
     label: str = ""
+    #: The cleaned-up expression actually parsed (after typo fixes etc.).
+    understood: str = ""
 
     @property
     def recurring(self) -> bool:
@@ -138,6 +141,72 @@ def _ordinal(n: int) -> str:
 
 # --------------------------------------------------------------------------- schedule parsing
 
+# --------------------------------------------------------------------------- forgiving input
+
+_KEYWORDS = {
+    "every", "each", "daily", "weekly", "monthly", "yearly", "annually", "hourly", "weekday", "weekdays",
+    "weekend", "weekends", "tomorrow", "today", "tonight", "noon", "midnight", "midday", "morning",
+    "afternoon", "evening", "night", "other", "starting", "beginning", "from", "last", "next", "month",
+    "months", "week", "weeks", "day", "days", "year", "years", "hour", "hours", "minute", "minutes",
+    "and", "the", "at", "on", "in", "of", "end",
+}  # fmt: skip
+VOCAB = sorted(_KEYWORDS | set(DAY_NAMES) | set(MONTHS))
+_NUMBER_WORDS = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6", "seven": "7",
+                 "eight": "8", "nine": "9", "ten": "10", "eleven": "11", "twelve": "12", "fifteen": "15",
+                 "twenty": "20", "thirty": "30", "forty-five": "45", "ninety": "90"}  # fmt: skip
+_PART_OF_DAY = r"(morning|afternoon|evening|night)"
+
+
+def _fix_word(word: str) -> str:
+    if len(word) < 4 or word in VOCAB or not word.isalpha():
+        return word
+    match = difflib.get_close_matches(word, VOCAB, n=1, cutoff=0.8)
+    return match[0] if match else word
+
+
+def normalize(text: str) -> str:
+    """Clean up a schedule the way a person meant it: typos, shorthand and casual phrasing.
+
+    ``"evry thrusday 9.30am"`` -> ``"every thursday at 9:30am"``,
+    ``"mondays and fridays at 6"`` -> ``"every mondays and fridays at 6"``,
+    ``"everyday"`` -> ``"every day"``, ``"twice a day"`` -> ``"every day at 9am and 9pm"``.
+    """
+    t = " ".join(text.strip().lower().split())
+    t = re.sub(r"(\d)\s*([ap])\.?m\.?(?!\w)", r"\1\2m", t)  # 9 a.m. -> 9am
+    t = re.sub(r"(\d{1,2})\.(\d{2})(?!\d)", r"\1:\2", t)  # 9.30 -> 9:30
+    t = re.sub(r"\beveryday\b", "every day", t)
+    t = re.sub(r"\s*o'?clock\b", "", t)
+    t = t.replace("&", " and ").replace("+", " and ")
+    t = re.sub(r"\s*,\s*", ",", t)
+    # split glued numbers and units: 2hrs -> 2 hrs (but leave 9am / 9pm alone)
+    t = re.sub(r"\b(\d+)(mins?|minutes?|hrs?|hours?|days?|weeks?|months?)\b", r"\1 \2", t)
+    words = []
+    for w in re.split(r"(\s+|,)", t):
+        words.append(_NUMBER_WORDS.get(w, _fix_word(w)))
+    t = "".join(words)
+    t = re.sub(r"\beveryday\b|\bevery single day\b|\bonce a day\b|\bonce daily\b", "every day", t)
+    t = re.sub(r"\bonce a week\b", "every week", t)
+    t = re.sub(r"\bonce a month\b", "every month", t)
+    t = re.sub(r"\bonce a year\b", "every year", t)
+    t = re.sub(r"\b(?:twice a day|twice daily|2 times a day)\b", "every day at 9am and 9pm", t)
+    t = re.sub(r"\b(?:three times a day|3 times a day)\b", "every day at 8am and 2pm and 8pm", t)
+    t = re.sub(r"\bevery (\d+) (?:mins?)\b", r"every \1 minutes", t)
+    t = re.sub(r"\bevery " + _PART_OF_DAY + r"\b", r"every day at \1", t)
+    t = re.sub(r"\bat (?:in the )?" + _PART_OF_DAY, r"at \1", t)
+    if " at " not in t:
+        t = re.sub(r"^(every .+?) (?:in the )?" + _PART_OF_DAY + "$", r"\1 at \2", t)
+    for word, unit in (("daily", "day"), ("weekly", "week"), ("monthly", "month"), ("yearly", "year"),
+                       ("annually", "year"), ("hourly", "hour")):  # fmt: skip
+        t = re.sub(rf"^{word}\b", f"every {unit}", t)
+    t = re.sub(r"^each\b", "every", t)
+    t = re.sub(r"^(?:on )?((?:mon|tue|wed|thu|fri|sat|sun)[a-z]*s\b)", r"every \1", t)  # "mondays at 9"
+    t = re.sub(r"^on ((?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,)", r"every \1", t)  # "on mon,thu"
+    # "every monday 9am" -> "every monday at 9am"
+    t = re.sub(r"^(every [^@]*?[a-z0-9,])\s+(\d{1,2}(?::\d{2})?(?:am|pm)|\d{1,2}:\d{2}|noon|midnight)((?:\s+and\s+.+)?)$",
+               r"\1 at \2\3", t) if " at " not in t else t  # fmt: skip
+    return " ".join(t.split())
+
+
 _AT_SPLIT = re.compile(r"\s+at\s+|^at\s+")
 _STARTING = re.compile(r"\s+(?:starting|from|beginning)\s+(.+)$")
 
@@ -158,7 +227,7 @@ def parse_schedule(text: str, now: datetime | None = None) -> Schedule:
     * one-offs: ``in 20 minutes``, ``tomorrow at 5pm``, ``friday at noon``, ``dec 3 at 2pm``, ``at 6pm``
     """
     now = (now or datetime.now()).replace(microsecond=0)
-    raw = " ".join(text.strip().lower().split())
+    raw = normalize(text)
     if not raw:
         raise ScheduleError("No schedule given. Try 'every day at 9am' or 'in 30 minutes'.")
 
@@ -171,10 +240,11 @@ def parse_schedule(text: str, now: datetime | None = None) -> Schedule:
         start = parsed.replace(hour=0, minute=0, second=0, microsecond=0)
         raw = raw[: m.start()]
 
+    understood = normalize(text)
     recurring = _parse_recurring(raw, now, start)
     if recurring:
-        return recurring
-    return _parse_one_off(raw, now)
+        return replace(recurring, understood=understood)
+    return replace(_parse_one_off(raw, now), understood=understood)
 
 
 def _with_times(rest: str) -> tuple[str, list[time] | None]:
@@ -311,7 +381,9 @@ def _parse_days(text: str) -> list[str]:
         elif part in DAY_NAMES:
             days.append(DAY_NAMES[part])
         else:
-            raise ScheduleError(f"'{part}' isn't a day of the week.")
+            raise ScheduleError(
+                f"'{part}' isn't a day of the week. Use names like mon, tue, wednesday, weekdays."
+            )
     if not days:
         raise ScheduleError("No days given.")
     return sorted(set(days), key=WEEKDAYS.index)
@@ -392,7 +464,7 @@ def _parse_one_off(raw: str, now: datetime) -> Schedule:
 
 _SCHEDULE_START = re.compile(
     r"\s(?=(?:every|each|daily|weekly|monthly|yearly|annually|hourly|weekdays?|weekends?|in\s+\d+|"
-    r"tomorrow|today|tonight|at\s+\d+|at\s+noon|at\s+midnight|on\s+[a-z]+|next\s+[a-z]+)\b)"
+    r"everyday|twice|once|(?:mon|tues|wednes|thurs|fri|satur|sun)days|tomorrow|today|tonight|at\s+\d+|at\s+noon|at\s+midnight|on\s+[a-z]+|next\s+[a-z]+)\b)"
 )
 
 
@@ -451,3 +523,97 @@ def extract_inline_meta(title: str) -> QuickAdd:
     priority = parse_priority(pm.group(1)) if pm else None
     clean = _PRIO_RE.sub(" ", _TAG_RE.sub(" ", title))
     return QuickAdd(title=" ".join(clean.split()), tags=tags, priority=priority)
+
+
+# --------------------------------------------------------------------------- guided builder / preview
+
+EXAMPLES = [
+    "every day at 9am",
+    "weekdays at 8:30",
+    "every mon,thu at 6pm",
+    "every 2 hours",
+    "every other friday",
+    "monthly on the 1st at 10am",
+    "tomorrow at 5pm",
+    "in 20 minutes",
+]
+
+REPEAT_CHOICES = [
+    ("once", "Just once"),
+    ("daily", "Every day"),
+    ("weekdays", "Weekdays (Mon-Fri)"),
+    ("weekends", "Weekends (Sat-Sun)"),
+    ("days", "On certain days of the week"),
+    ("interval", "Every few minutes / hours"),
+    ("ndays", "Every few days"),
+    ("nweeks", "Every few weeks"),
+    ("monthly", "Every month"),
+    ("yearly", "Every year"),
+]
+
+
+def build_expression(
+    repeat: str,
+    *,
+    times: str = "",
+    days: list[str] | None = None,
+    every: int | str = 1,
+    unit: str = "hours",
+    date: str = "",
+) -> str:
+    """Turn the guided form's fields into a schedule expression for :func:`parse_schedule`."""
+    times = times.strip()
+    at = f" at {times}" if times else ""
+    n = int(str(every).strip() or 1)
+    day_list = ",".join(days or [])
+    date = date.strip()
+    if repeat == "once":
+        if not date and not times:
+            raise ScheduleError("Pick a date and/or a time, e.g. 'tomorrow' and '5pm'.")
+        if not date:
+            return f"at {times}"
+        return f"{date}{at}"
+    if repeat == "daily":
+        return f"every day{at}"
+    if repeat == "weekdays":
+        return f"weekdays{at}"
+    if repeat == "weekends":
+        return f"weekends{at}"
+    if repeat == "days":
+        if not day_list:
+            raise ScheduleError("Tick at least one day.")
+        return f"every {day_list}{at}"
+    if repeat == "interval":
+        if n < 1:
+            raise ScheduleError("The interval must be at least 1.")
+        return f"every {n} {unit}"
+    if repeat == "ndays":
+        return f"every {n} days{at}"
+    if repeat == "nweeks":
+        on = f" on {day_list}" if day_list else ""
+        return f"every {n} weeks{on}{at}"
+    if repeat == "monthly":
+        on = f" on the {date}" if date else ""
+        return f"every {n} months{on}{at}" if n > 1 else f"every month{on}{at}"
+    if repeat == "yearly":
+        if not date:
+            raise ScheduleError("Which date? e.g. 'mar 14'.")
+        return f"every year on {date}{at}"
+    raise ScheduleError(f"Unknown repeat option '{repeat}'.")
+
+
+def upcoming(schedule: Schedule, count: int = 5) -> list[datetime]:
+    """The next few times a schedule will fire, starting with its first due time."""
+    out = [schedule.due]
+    while schedule.rule and len(out) < count:
+        nxt = next_occurrence(schedule.rule, out[-1])
+        if nxt is None:
+            break
+        out.append(nxt)
+    return out
+
+
+def explain(text: str, now: datetime | None = None, count: int = 5) -> tuple[Schedule, list[datetime]]:
+    """Parse and return the schedule with its next ``count`` occurrences (raises ScheduleError)."""
+    sched = parse_schedule(text, now)
+    return sched, upcoming(sched, count)

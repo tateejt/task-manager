@@ -131,3 +131,67 @@ def test_inline_meta():
     assert q.title == "Pay rent"
     assert q.tags == ["bills", "home"]
     assert q.priority == 2
+
+
+@pytest.mark.parametrize(
+    ("typed", "label"),
+    [
+        ("evry thrusday 9.30am", "Every Thu at 9:30 AM"),
+        ("mondays and fridays at 6pm", "Every Mon, Fri at 6:00 PM"),
+        ("everyday at 8", "Every day at 8:00 AM"),
+        ("twice a day", "Every day at 9:00 AM and 9:00 PM"),
+        ("every morning", "Every day at 8:00 AM"),
+        ("every weekday morning", "Weekdays at 8:00 AM"),
+        ("every 2hrs", "Every 2 hours"),
+        ("every wendsday at 7 p.m.", "Every Wed at 7:00 PM"),
+        ("on mon,thu at 9", "Every Mon, Thu at 9:00 AM"),
+        ("every tuesday 6pm", "Every Tue at 6:00 PM"),
+        ("once a week", "Every Tue at 9:00 AM"),
+        ("every three days", "Every 3 days at 9:00 AM"),
+        ("weekdys at 7:30", "Weekdays at 7:30 AM"),
+        ("every 15 mins", "Every 15 minutes"),
+        ("monthly on the 1st 10am", "Every month on the 1st at 10:00 AM"),
+        ("Every Day At 9AM", "Every day at 9:00 AM"),
+        ("every year on dec 25 8am", "Every year on Dec 25 at 8:00 AM"),
+    ],
+)
+def test_forgiving_input(typed, label):
+    s = parse_schedule(typed, NOW)
+    assert s.label == label
+    assert s.understood
+
+
+def test_typo_fix_does_not_invent_days():
+    with pytest.raises(ScheduleError, match="blursday"):
+        parse_schedule("every blursday", NOW)
+
+
+@pytest.mark.parametrize(
+    ("repeat", "kwargs", "expr"),
+    [
+        ("once", {"date": "tomorrow", "times": "5pm"}, "tomorrow at 5pm"),
+        ("once", {"times": "5pm"}, "at 5pm"),
+        ("daily", {"times": "8am, 8pm"}, "every day at 8am, 8pm"),
+        ("weekdays", {}, "weekdays"),
+        ("days", {"days": ["mon", "thu"], "times": "9am"}, "every mon,thu at 9am"),
+        ("interval", {"every": 90, "unit": "minutes"}, "every 90 minutes"),
+        ("ndays", {"every": 3}, "every 3 days"),
+        ("nweeks", {"every": 2, "days": ["sat"]}, "every 2 weeks on sat"),
+        ("monthly", {"date": "1st", "times": "10am"}, "every month on the 1st at 10am"),
+        ("monthly", {"every": 3, "date": "last"}, "every 3 months on the last"),
+        ("yearly", {"date": "mar 14"}, "every year on mar 14"),
+    ],
+)
+def test_build_expression(repeat, kwargs, expr):
+    from nudge.schedule import build_expression
+
+    assert build_expression(repeat, **kwargs) == expr
+    parse_schedule(expr, NOW)  # and it parses
+
+
+@pytest.mark.parametrize(("repeat", "kwargs"), [("days", {}), ("once", {}), ("yearly", {})])
+def test_build_expression_needs_input(repeat, kwargs):
+    from nudge.schedule import build_expression
+
+    with pytest.raises(ScheduleError):
+        build_expression(repeat, **kwargs)

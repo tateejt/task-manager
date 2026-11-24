@@ -57,3 +57,16 @@ class Completion(SQLModel, table=True):
     due_at: NaiveDatetime
     at: NaiveDatetime = Field(default_factory=lambda: datetime.now().replace(microsecond=0))
     status: str = "done"  # done | skipped | missed
+
+
+class UndoEntry(SQLModel, table=True):
+    """A snapshot taken before an action so it can be undone."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    reminder_id: int = Field(index=True, foreign_key="reminder.id", ondelete="CASCADE")
+    action: str  # done | skip | snooze | reset | pause | resume | edit
+    at: NaiveDatetime = Field(default_factory=lambda: datetime.now().replace(microsecond=0))
+    #: JSON of the reminder's fields before the action.
+    state: str
+    #: History row created by the action, removed again on undo.
+    completion_id: int | None = None
