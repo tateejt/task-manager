@@ -72,3 +72,26 @@ def test_parse_duration():
     assert parse_duration("15m") == 15
     assert parse_duration("2h") == 120
     assert parse_duration("1h30m") == 90
+
+
+def test_double_done_then_undo_and_reset():
+    invoke("add", "Floss", "every", "day", "at", "9pm")
+    assert "Done: Floss" in invoke("done", "1")
+    out = invoke("done", "1")
+    assert "already done" in out
+    assert "Undid done on Floss" in invoke("undo")
+    assert "Reset: Floss" in invoke("reset", "1")
+
+
+def test_preview_shows_understanding():
+    out = invoke("preview", "evry", "thrusday", "9.30am")
+    assert "Every Thu at 9:30 AM" in out
+    assert "understood as" in out
+    bad = runner.invoke(app, ["preview", "every", "blursday"])
+    assert bad.exit_code == 1
+
+
+def test_add_without_schedule_non_interactive_fails_nicely():
+    result = runner.invoke(app, ["add", "Just a title"])
+    assert result.exit_code == 1
+    assert "When should I remind you" in result.output

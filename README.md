@@ -14,18 +14,26 @@ nudge run          # or: nudge startup install
 
 ## Features
 
+- **No exact wording needed**: typos and casual phrasing work (`evry thrusday 9.30am`, `mondays and fridays at 6`,
+  `twice a day`, `everyday at 8`). Nudge always shows what it understood and the next few times before saving.
+- **Guided form**: press `a` in the dashboard to pick the repeat pattern, days and times from a form, with a live
+  preview. Or run `nudge add` with no arguments to be asked step by step.
+- **Undo anything**: Done, Skip, Snooze, Pause, Edit and Reset can all be undone (`u` in the dashboard, `nudge undo`).
+  Pressing Done twice won't eat the next occurrence, and `nudge reset` puts a reminder back on its schedule.
 - **Natural schedules**: daily, weekdays, weekends, specific days, every N minutes/hours/days/weeks/months,
   monthly on a date or the last day, yearly, several times a day, `starting <date>`, and one-offs like
   `in 20 minutes` or `friday at noon`.
-- **Actionable toasts**: Done, Snooze (default and 1 hour) and Skip buttons right on the Windows notification.
-  High-priority reminders and nags stay on screen until you act.
+- **Clear notifications**: branded Nudge toasts with a colour-coded icon (blue normal, amber still waiting,
+  red urgent), a status line ("Due now", "Overdue 25 min", "Snoozed"), notes or schedule, your streak, and
+  **Done**, a **Snooze** dropdown (10 minutes to tomorrow morning) and **Skip** buttons. Important reminders
+  and nags stay on screen until you act.
 - **Nagging**: if you ignore a reminder it comes back every 15 minutes (configurable, capped).
 - **Streaks and history**: finishing on time grows a 🔥 streak; ignoring an occurrence until the next one
   arrives records it as missed and resets the streak. Skipping keeps it.
 - **Quiet hours**: nothing between 22:00 and 07:00 except urgent reminders (configurable).
 - **Tags and priorities**: `#tag` and `!low`/`!high`/`!urgent` right in the title, or `-t` / `-p` flags.
-- **Dashboard**: run `nudge` with no arguments for an interactive dashboard (add, done, snooze, skip,
-  pause, delete, filter, all from the keyboard).
+- **Dashboard**: run `nudge` with no arguments for an interactive dashboard. Keys: `a` new, `e` edit,
+  `d` done, `s` snooze, `k` skip, `u` undo, `r` reset, `p` pause, `x` delete, `/` filter, `h` show all.
 - **Bulk import/export** in YAML or CSV (see [`examples/reminders.yaml`](examples/reminders.yaml)).
 - **Starts at login** with no admin rights and no console window (`nudge startup install`).
 
@@ -48,12 +56,15 @@ For development: `uv sync`, then `uv run pytest` and `uv run nudge ...`.
 | Command | What it does |
 | --- | --- |
 | `nudge` / `nudge tui` | Interactive dashboard |
-| `nudge add TITLE [WHEN...]` | Add a reminder (`-t tag`, `-p priority`, `-n notes`) |
+| `nudge add [TITLE] [WHEN...]` | Add a reminder (`-t tag`, `-p priority`, `-n notes`); no args = step by step |
+| `nudge preview WHEN...` | Check what a schedule means and its next times |
 | `nudge list` | Open reminders, soonest first (`--all`, `--tag`, `--search`) |
 | `nudge today` | What's due now and later today |
 | `nudge agenda -d 7` | Every upcoming occurrence for the next days |
 | `nudge show ID` | Details and recent history |
-| `nudge done ID...` | Mark done (recurring ones move to the next time) |
+| `nudge done ID...` | Mark done (recurring ones move to the next time; `--early` to do the next one ahead) |
+| `nudge undo [ID]` | Undo the last done / skip / snooze / pause / edit / reset |
+| `nudge reset ID...` | Put a reminder back on its schedule (next time from now) |
 | `nudge snooze ID [10m\|1h\|1h30m]` | Snooze |
 | `nudge skip ID...` | Skip this occurrence, keep the streak |
 | `nudge pause ID...` / `resume ID...` | Turn reminders off and on |
@@ -101,7 +112,9 @@ src/nudge/
   models.py     SQLModel tables: Reminder, Completion (history)
   service.py    add/complete/snooze/skip, missed-occurrence rollover, alert selection, quiet hours
   runner.py     the background loop; toast button clicks come back through a queue
-  notify.py     Windows toasts (windows-toasts) with a console fallback elsewhere
+  notify.py     notification content + Windows toasts (windows-toasts), console fallback elsewhere
+  forms.py      the guided new/edit form with live preview (Textual)
+  assets/       notification icons (regenerate with tools/make_icons.py)
   startup.py    HKCU Run key so the runner starts at sign-in via pythonw (no window)
   cli.py        Typer + Rich commands
   tui.py        Textual dashboard

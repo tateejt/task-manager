@@ -16,7 +16,7 @@ from rich.table import Table
 from . import __version__
 from .config import Settings, data_dir, db_path
 from .schedule import ScheduleError
-from .service import NotFound, ReminderService
+from .service import AlreadyDone, NotFound, NothingToUndo, ReminderService
 from .ui import priority_label, relative, reminder_table
 
 app = typer.Typer(
@@ -55,6 +55,9 @@ def _ids(ids: list[int], fn, verb: str) -> None:
             r = fn(rid)
         except NotFound as e:
             err.print(f"[red]✗[/] {e}")
+            continue
+        except AlreadyDone as e:
+            err.print(f"[yellow]![/] {e} [dim](add --early to do the next one ahead of time)[/]")
             continue
         extra = ""
         if not r.active:
@@ -96,32 +99,100 @@ def main(
             console.print(ctx.get_help())
 
 
+def _print_schedule(label: str, times: list[datetime], understood: str = "", typed: str = "") -> None:
+    nxt = "  ·  ".join(t.strftime("%a %b %d %H:%M") for t in times)
+    console.print(f"  [bold]{label}[/]\n  [dim]next:[/] {nxt}")
+    if understood and understood != " ".join(typed.lower().split()):
+        console.print(f"  [dim]understood as “{understood}”[/]")
+
+
+def _ask_schedule(default: str = "") -> str:
+    """Prompt until the user types a schedule we understand, showing what it means."""
+    from rich.prompt import Prompt
+
+    from .schedule import EXAMPLES, explain
+
+    console.print("[dim]Examples: " + " · ".join(EXAMPLES[:6]) + "[/]")
+    while True:
+        text = Prompt.ask("[cyan]When?[/]", default=default or None, console=console)
+        if not text:
+            continue
+        try:
+            sched, times = explain(text, now(), 3)
+        except ScheduleError as e:
+            err.print(f"  [red]✗[/] {e}")
+            continue
+        _print_schedule(sched.label, times, sched.understood, text)
+        return text
+
+
 @app.command()
 def add(
-    title: Annotated[str, typer.Argument(help="What to do. May include #tags and !priority.")],
+    title: Annotated[str | None, typer.Argument(help="What to do. May include #tags and !priority.")] = None,
     when: Annotated[list[str] | None, typer.Argument(help="When, e.g. every mon,thu at 9am")] = None,
     tag: Annotated[list[str] | None, typer.Option("--tag", "-t", help="Tag (repeatable).")] = None,
     priority: Annotated[str | None, typer.Option("--priority", "-p", help="low|normal|high|urgent")] = None,
     notes: Annotated[str, typer.Option("--notes", "-n", help="Extra detail shown in the notification.")] = "",
 ):
-    """Add a reminder.
+    """Add a reminder. Run it with no arguments to be asked step by step.
 
     [bold]Examples[/]
 
+      nudge add
       nudge add "Water plants" every mon,thu at 9am
       nudge add "Take meds #health !high" every day at 8am and 8pm
       nudge add "Stretch" every 90 minutes
       nudge add "Pay rent" monthly on the 1st at 10am -t bills
       nudge add "Call mom tomorrow at 6pm"
+
+    Typos and casual phrasing are fine: "evry thrusday 9.30am", "mondays and fridays at 6", "twice a day".
     """
+    from .schedule import explain, split_title_and_schedule
+
+    interactive = sys.stdin.isatty()
+    if title is None:
+        if not interactive:
+            fail('Give a title, e.g. nudge add "Water plants" every mon at 9am')
+        from rich.prompt import Prompt
+
+        title = Prompt.ask("[cyan]What do you want to be reminded about?[/]", console=console).strip()
+        if not title:
+            fail("A reminder needs a title.")
+    when_text = " ".join(when or [])
+    if not when_text:
+        title, when_text = split_title_and_schedule(title, now())
+    if not when_text:
+        if not interactive:
+            fail("When should I remind you? e.g. 'every day at 9am', 'weekdays at 8', 'in 30 minutes'.")
+        when_text = _ask_schedule()
     try:
-        r = svc().add(title, " ".join(when or []), tags=tag or [], priority=priority, notes=notes)
+        r = svc().add(title, when_text, tags=tag or [], priority=priority, notes=notes)
     except ScheduleError as e:
-        fail(str(e))
+        if not interactive:
+            fail(str(e))
+        err.print(f"[red]✗[/] {e}")
+        when_text = _ask_schedule()
+        r = svc().add(title, when_text, tags=tag or [], priority=priority, notes=notes)
+    sched, times = explain(when_text, now(), 3)
     console.print(
-        f"[green]✓[/] Added [bold]#{r.id} {r.title}[/]  [dim]{r.schedule_label}[/]\n"
-        f"  first reminder {relative(r.due_at, now())} ([cyan]{r.due_at:%a %b %d, %H:%M}[/])"
+        f"[green]✓[/] Added [bold]#{r.id} {r.title}[/]  [dim](first one {relative(r.due_at, now())})[/]"
     )
+    _print_schedule(r.schedule_label, times, sched.understood, when_text)
+
+
+@app.command()
+def preview(when: Annotated[list[str], typer.Argument(help="A schedule, e.g. every other friday at 5pm")]):
+    """Check what a schedule means before adding it: shows the next few times."""
+    from .schedule import EXAMPLES, explain
+
+    text = " ".join(when)
+    try:
+        sched, times = explain(text, now(), 5)
+    except ScheduleError as e:
+        err.print(f"[red]✗[/] {e}")
+        err.print("[dim]Try: " + " · ".join(EXAMPLES) + "[/]")
+        raise typer.Exit(1) from None
+    _print_schedule(sched.label, times, sched.understood, text)
 
 
 @app.command("list")
@@ -228,17 +299,53 @@ def show(rid: Annotated[int, typer.Argument(help="Reminder id.")]):
 
 
 @app.command()
-def done(ids: Annotated[list[int], typer.Argument(help="Reminder id(s).")]):
-    """Mark reminder(s) done. Recurring ones move to their next time and grow their streak."""
+def done(
+    ids: Annotated[list[int], typer.Argument(help="Reminder id(s).")],
+    early: Annotated[
+        bool, typer.Option("--early", help="Also allow ticking off the next occurrence.")
+    ] = False,
+):
+    """Mark reminder(s) done. Recurring ones move to their next time and grow their streak.
+
+    Pressing done twice won't skip ahead: once the current one is done, the next must come due first
+    (or use --early). Made a mistake? `nudge undo`.
+    """
     s = svc()
-    _ids(ids, s.complete, "Done")
+    _ids(ids, lambda i: s.complete(i, force=early), "Done")
 
 
 @app.command()
-def skip(ids: Annotated[list[int], typer.Argument(help="Reminder id(s).")]):
+def skip(
+    ids: Annotated[list[int], typer.Argument(help="Reminder id(s).")],
+    early: Annotated[bool, typer.Option("--early", help="Also allow skipping the next occurrence.")] = False,
+):
     """Skip the current occurrence without breaking your streak."""
     s = svc()
-    _ids(ids, s.skip, "Skipped")
+    _ids(ids, lambda i: s.skip(i, force=early), "Skipped")
+
+
+UNDO_VERBS = {"done": "Done", "skip": "Skip", "snooze": "Snooze", "reset": "Reset",
+              "pause": "Pause", "resume": "Resume", "edit": "Edit"}  # fmt: skip
+
+
+@app.command()
+def undo(rid: Annotated[int | None, typer.Argument(help="Only undo this reminder's last action.")] = None):
+    """Undo the last done / skip / snooze / reset / pause / edit. Run it again to go further back."""
+    try:
+        action, r = svc().undo(rid)
+    except NothingToUndo as e:
+        fail(str(e))
+    console.print(
+        f"[green]↶[/] Undid {UNDO_VERBS.get(action, action).lower()} on [bold]{r.title}[/]  "
+        f"[dim]next {relative(r.effective_due, now())} ({r.effective_due:%a %b %d %H:%M})[/]"
+    )
+
+
+@app.command()
+def reset(ids: Annotated[list[int], typer.Argument(help="Reminder id(s).")]):
+    """Put reminders back on their schedule: next time from now, no snooze. Undoable."""
+    s = svc()
+    _ids(ids, s.reset, "Reset")
 
 
 @app.command()
