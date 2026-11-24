@@ -1,0 +1,43 @@
+[project]
+name = "nudge"
+version = "0.1.0"
+description = "A modern terminal reminder app for Windows with recurring schedules and actionable toast notifications."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "textual>=0.80",
+    "sqlmodel>=0.0.22",
+    "python-dateutil>=2.9",
+    "dateparser>=1.2",
+    "platformdirs>=4.2",
+    "pyyaml>=6.0",
+    "windows-toasts>=1.3; sys_platform == 'win32'",
+]
+
+[project.scripts]
+nudge = "nudge.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nudge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]  # the formatter handles line length
