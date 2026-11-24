@@ -21,7 +21,7 @@ from .schedule import (
     build_expression,
     explain,
     extract_inline_meta,
-    split_title_and_schedule,
+    schedule_in_title,
 )
 
 DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -176,11 +176,13 @@ class ReminderForm(ModalScreen[ReminderDraft | None]):
         self.query_one("#date", Input).placeholder = DATE_HINT.get(str(repeat), "")
 
     def _sync_builder_state(self) -> None:
-        typed = bool(self.query_one("#quick", Input).value.strip())
+        typed = bool(self.query_one("#quick", Input).value.strip()) or bool(
+            schedule_in_title(self.query_one("#title", Input).value)
+        )
         for row in ("#repeat", "#row-days", "#row-every", "#row-date", "#row-times"):
             self.query_one(row).set_class(typed, "muted")
         self.query_one("#or", Static).update(
-            "── using what you typed above (clear it to use the builder) ──"
+            "── using the schedule you typed above (clear it to use the builder) ──"
             if typed
             else "── or build it step by step ──"
         )
@@ -190,6 +192,9 @@ class ReminderForm(ModalScreen[ReminderDraft | None]):
         quick = self.query_one("#quick", Input).value.strip()
         if quick:
             return quick
+        from_title = schedule_in_title(self.query_one("#title", Input).value)
+        if from_title:
+            return from_title[1]
         return build_expression(
             str(self.query_one("#repeat", Select).value),
             times=self.query_one("#times", Input).value,
@@ -203,6 +208,9 @@ class ReminderForm(ModalScreen[ReminderDraft | None]):
         self._sync_builder_state()
         preview = self.query_one("#preview", Static)
         title = self.query_one("#title", Input).value.strip()
+        if not self.query_one("#quick", Input).value.strip():
+            from_title = schedule_in_title(title)
+            title = from_title[0] if from_title else title
         try:
             when = self.schedule_text()
             sched, times = explain(when, datetime.now(), 3)
@@ -232,21 +240,6 @@ class ReminderForm(ModalScreen[ReminderDraft | None]):
     def _changed(self) -> None:
         self._update_preview()
 
-    @on(Input.Changed, "#title")
-    def _title_changed(self, event: Input.Changed) -> None:
-        # Typing "Water plants every mon at 9" in the title moves the schedule into "Type it".
-        title, when = split_title_and_schedule(event.value)
-        quick = self.query_one("#quick", Input)
-        if when and not quick.value.strip():
-            try:
-                explain(when)
-            except ScheduleError:
-                return
-            with self.prevent(Input.Changed):
-                event.input.value = title
-                quick.value = when
-            self._update_preview()
-
     @on(Input.Submitted)
     def _submitted(self) -> None:
         self.action_save()
@@ -259,6 +252,10 @@ class ReminderForm(ModalScreen[ReminderDraft | None]):
     def action_save(self) -> None:
         self._update_preview()
         title_raw = self.query_one("#title", Input).value.strip()
+        if not self.query_one("#quick", Input).value.strip():
+            from_title = schedule_in_title(title_raw)
+            if from_title:
+                title_raw = from_title[0]
         meta = extract_inline_meta(title_raw)
         if not meta.title:
             self.notify("Give the reminder a name first.", severity="warning")

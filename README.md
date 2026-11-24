@@ -14,6 +14,10 @@ nudge run          # or: nudge startup install
 
 ## Features
 
+- **Desktop app**: on Windows, `nudge` (or the Start-menu shortcut from `nudge shortcut`) opens a clickable
+  window. It has your reminders grouped by Due now, Later today, Tomorrow and so on, with one-click Done, Snooze and
+  Undo, search and tag filters, an Upcoming calendar, History, and Settings. Closing the window keeps Nudge in the
+  tray, where it keeps sending notifications. The terminal dashboard is still available with `nudge tui`.
 - **No exact wording needed**: typos and casual phrasing work (`evry thrusday 9.30am`, `mondays and fridays at 6`,
   `twice a day`, `everyday at 8`). Nudge always shows what it understood and the next few times before saving.
 - **Guided form**: press `a` in the dashboard to pick the repeat pattern, days and times from a form, with a live
@@ -46,7 +50,9 @@ git clone https://github.com/tateejt/task-manager
 cd task-manager
 uv tool install .        # puts `nudge` on your PATH
 nudge test-notify        # check that notifications show up
-nudge startup install    # run in the background every time you sign in
+nudge shortcut           # add Nudge to the Start menu and desktop
+nudge startup install    # open Nudge in the tray every time you sign in
+nudge                    # open the app
 ```
 
 For development: `uv sync`, then `uv run pytest` and `uv run nudge ...`.
@@ -55,7 +61,9 @@ For development: `uv sync`, then `uv run pytest` and `uv run nudge ...`.
 
 | Command | What it does |
 | --- | --- |
-| `nudge` / `nudge tui` | Interactive dashboard |
+| `nudge` / `nudge app` | Desktop window (terminal dashboard if the app isn't available) |
+| `nudge tui` | Terminal dashboard |
+| `nudge shortcut` | Start-menu (and desktop) shortcut |
 | `nudge add [TITLE] [WHEN...]` | Add a reminder (`-t tag`, `-p priority`, `-n notes`); no args = step by step |
 | `nudge preview WHEN...` | Check what a schedule means and its next times |
 | `nudge list` | Open reminders, soonest first (`--all`, `--tag`, `--search`) |
@@ -73,7 +81,7 @@ For development: `uv sync`, then `uv run pytest` and `uv run nudge ...`.
 | `nudge history` / `nudge stats` | What you did, missed, and your streaks |
 | `nudge import FILE` / `export [FILE]` | YAML or CSV |
 | `nudge run` | The background notifier |
-| `nudge startup install\|uninstall\|status` | Start at Windows sign-in |
+| `nudge startup install\|uninstall\|status` | Start in the tray at sign-in (`--headless` for notifier only) |
 | `nudge config show` / `config set KEY VALUE` | Settings |
 
 ### Schedule examples
@@ -114,6 +122,7 @@ src/nudge/
   runner.py     the background loop; toast button clicks come back through a queue
   notify.py     notification content + Windows toasts (windows-toasts), console fallback elsewhere
   forms.py      the guided new/edit form with live preview (Textual)
+  gui/          the desktop window (Flet): app.py views + tray, presenter.py display logic
   assets/       notification icons (regenerate with tools/make_icons.py)
   startup.py    HKCU Run key so the runner starts at sign-in via pythonw (no window)
   cli.py        Typer + Rich commands

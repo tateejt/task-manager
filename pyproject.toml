@@ -15,13 +15,21 @@ dependencies = [
     "platformdirs>=4.2",
     "pyyaml>=6.0",
     "windows-toasts>=1.4; sys_platform == 'win32'",
+    # desktop window + tray icon
+    "flet>=1.1",
+    "flet-desktop>=1.1; sys_platform == 'win32' or sys_platform == 'darwin'",
+    "pystray>=0.19; sys_platform == 'win32'",
+    "pillow>=10.3; sys_platform == 'win32'",
 ]
 
 [project.scripts]
 nudge = "nudge.cli:app"
 
+[project.gui-scripts]
+nudge-app = "nudge.gui:main"
+
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "ruff>=0.6", "flet-web>=1.1"]
 
 [build-system]
 requires = ["hatchling"]
