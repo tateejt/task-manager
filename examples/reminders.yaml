@@ -1,0 +1,30 @@
+# Import with:  nudge import examples/reminders.yaml
+reminders:
+  - title: Take vitamins
+    when: every day at 8am
+    tags: [health]
+    priority: high
+  - title: Drink water
+    when: every 2 hours
+    tags: [health]
+  - title: Stand up and stretch
+    when: weekdays at 10am and 3pm
+  - title: Water plants
+    when: every mon,thu at 9am
+    tags: [home]
+  - title: Take out trash
+    when: every tue at 7pm
+    tags: [home]
+  - title: Weekly review
+    when: every fri at 4pm
+    tags: [work]
+    notes: Inbox zero, plan next week
+  - title: Pay rent
+    when: monthly on the 1st at 10am
+    tags: [bills]
+    priority: urgent
+  - title: Change HVAC filter
+    when: every 3 months on the 1st
+    tags: [home]
+  - title: Back up laptop
+    when: every other sunday at 6pm
