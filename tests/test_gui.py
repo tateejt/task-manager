@@ -210,3 +210,39 @@ def test_inline_editor(window, svc):
     assert svc.get(r.id)
     window.editor.delete()
     assert all(x.id != r.id for x in svc.list(include_inactive=True))
+
+
+def test_notes_tab(window, svc):
+    window.set_tab("notes")
+    assert window.input.hint_text == "Jot a value…" and window.body.controls
+    window.input.value = "case 48213"
+    window._on_input()
+    assert window.result.value == "case 48213"
+    window.submit()
+    assert window.case_ref == "48213"
+
+    window.input.value = "INB exported 1,240"
+    window._on_input()
+    assert window.result.value == "INB exported = 1,240" and "case 48213" in window.detail.value
+    window.submit()
+    window.input.value = "INB returned 42"
+    window._on_input()
+    window.submit()
+    assert [e.value for e in window.pad.entries(case="48213")] == ["42", "1,240"]
+
+    window.copy_current()
+    assert window.last_copied.splitlines()[1:] == ["INB exported: 1,240", "INB returned: 42"]
+
+    e = window.pad.entries(case="48213")[0]
+    window.delete_entry(e)
+    assert len(window.pad.entries(case="48213")) == 1
+
+    window.close_case()
+    window.input.value = "/482"
+    window._on_input()
+    assert window.query == "482" and window.body.controls
+
+    window.open_pad()  # no real window in tests: just switches to the Notes tab
+    assert window.pad_mode and window.tab == "notes"
+    window.set_tab("today")
+    assert not window.pad_mode and window.input.hint_text == "Remind me to…"

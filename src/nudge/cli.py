@@ -612,9 +612,65 @@ def startup_status():
     console.print(f"[green]On[/]: {cmd}" if cmd else "[yellow]Off[/]. Enable with `nudge startup install`.")
 
 
+@app.command()
+def note(
+    text: Annotated[list[str], typer.Argument(help="e.g. INB exported 1,240   or   case 48213")],
+    case: Annotated[str | None, typer.Option("--case", "-c", help="Case or ticket number.")] = None,
+):
+    """Jot a value in the scratchpad (label + value), optionally under a case."""
+    from .scratch import ScratchPad
+
+    entry, c = ScratchPad(svc().engine).add(" ".join(text), case=case)
+    where = f"case {c.ref}" if c else "today's notes"
+    if entry is None:
+        console.print(f"[green]✓[/] Case {c.ref} is ready" if c else "[yellow]Nothing to save[/]")
+        return
+    shown = f"{entry.label} = [bold cyan]{entry.value}[/]" if entry.label else entry.value
+    console.print(f"[green]✓[/] {shown} [dim]→ {where}[/]")
+
+
+@app.command()
+def notes(
+    case: Annotated[str | None, typer.Option("--case", "-c", help="Only this case.")] = None,
+    search: Annotated[str | None, typer.Option("--search", "-s", help="Find text or a case number.")] = None,
+    copy: Annotated[bool, typer.Option("--copy", help="Print just the paste-ready summary.")] = False,
+    limit: Annotated[int, typer.Option("--limit", "-n", help="How many groups to show.")] = 5,
+):
+    """Show scratchpad notes grouped by case, ready to paste."""
+    from .scratch import ScratchPad, summary
+
+    pad = ScratchPad(svc().engine)
+    groups = pad.groups(query=search or "")
+    if case:
+        groups = [g for g in groups if g.case and g.case.ref == case]
+    if not groups:
+        console.print("[dim]No notes yet. Try: nudge note INB exported 1,240 -c 48213[/]")
+        return
+    for g in groups[:limit]:
+        text = summary(g)
+        if copy:
+            sys.stdout.write(text + "\n\n")
+        else:
+            console.print(text, highlight=False)
+            console.print()
+
+
+@app.command()
+def pad():
+    """Open the scratchpad window."""
+    from . import gui
+
+    if not gui.available():
+        fail("The desktop app needs Flet: uv tool install --reinstall .")
+    from .gui.app import run as run_app
+
+    run_app(pad=True)
+
+
 @app.command("app")
 def open_app(
     minimized: Annotated[bool, typer.Option("--minimized", help="Start hidden in the tray.")] = False,
+    pad: Annotated[bool, typer.Option("--pad", help="Open straight into the scratchpad.")] = False,
     web: Annotated[
         int | None, typer.Option("--web", help="Serve the window in a browser on this port.")
     ] = None,
@@ -626,7 +682,7 @@ def open_app(
         fail("The desktop app needs Flet: uv tool install --reinstall . (or pip install flet)")
     from .gui.app import run as run_app
 
-    run_app(minimized=minimized, web_port=web)
+    run_app(minimized=minimized, web_port=web, pad=pad)
 
 
 @app.command()

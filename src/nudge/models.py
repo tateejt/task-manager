@@ -70,3 +70,34 @@ class UndoEntry(SQLModel, table=True):
     state: str
     #: History row created by the action, removed again on undo.
     completion_id: int | None = None
+
+
+class Case(SQLModel, table=True):
+    """A support case (or ticket) that scratchpad entries are grouped under.
+
+    ``template`` is reserved for case templates (a named checklist of fields to fill in).
+    """
+
+    id: int | None = Field(default=None, primary_key=True)
+    ref: str = Field(index=True, unique=True)  # "48213", "INC-0042"
+    title: str = ""
+    template: str | None = None
+    created_at: NaiveDatetime = Field(default_factory=lambda: datetime.now().replace(microsecond=0))
+    updated_at: NaiveDatetime = Field(default_factory=lambda: datetime.now().replace(microsecond=0))
+
+
+class Entry(SQLModel, table=True):
+    """One scratchpad line: a labeled value ("INB exported" = "1,240") or a plain note (no label)."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    case_id: int | None = Field(default=None, index=True, foreign_key="case.id", ondelete="CASCADE")
+    label: str = ""
+    value: str = ""
+    raw: str = ""  # exactly what was typed
+    created_at: NaiveDatetime = Field(
+        default_factory=lambda: datetime.now().replace(microsecond=0), index=True
+    )
+
+    @property
+    def text(self) -> str:
+        return f"{self.label}: {self.value}" if self.label else self.value
