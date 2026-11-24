@@ -287,6 +287,10 @@ def _parse_recurring(raw: str, now: datetime, start: datetime) -> Schedule | Non
             raise ScheduleError(f"Couldn't understand '{raw}'.")
         return _weekly(now, start, _parse_days(word), times, interval, None)
 
+    if len(word) == 1 and not count_s:
+        raise ScheduleError(
+            f"Couldn't understand '{raw}'. Did you mean 'every {word}…' with a number, like 'every 5{word}'?"
+        )
     freq = UNITS[word]
     every = f"Every {interval} {FREQ_LABEL[freq]}s" if interval > 1 else f"Every {FREQ_LABEL[freq]}"
 
@@ -617,3 +621,15 @@ def explain(text: str, now: datetime | None = None, count: int = 5) -> tuple[Sch
     """Parse and return the schedule with its next ``count`` occurrences (raises ScheduleError)."""
     sched = parse_schedule(text, now)
     return sched, upcoming(sched, count)
+
+
+def schedule_in_title(title: str, now: datetime | None = None) -> tuple[str, str] | None:
+    """If a title already contains a valid schedule ("Stretch every 2 hours"), return (title, schedule)."""
+    clean, when = split_title_and_schedule(title, now)
+    if not when:
+        return None
+    try:
+        parse_schedule(when, now)
+    except ScheduleError:
+        return None
+    return clean, when

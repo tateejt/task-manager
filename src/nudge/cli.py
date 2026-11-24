@@ -91,7 +91,11 @@ def main(
         console.print(f"nudge {__version__}")
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
-        if sys.stdout.isatty():
+        from . import gui
+
+        if sys.platform == "win32" and gui.available():
+            gui.main()
+        elif sys.stdout.isatty():
             from .tui import NudgeApp
 
             NudgeApp(svc()).run()
@@ -557,12 +561,16 @@ def config_set(key: str, value: str):
 
 
 @startup_app.command("install")
-def startup_install():
-    """Run Nudge in the background every time you sign in to Windows."""
-    from . import startup
+def startup_install(
+    headless: Annotated[
+        bool, typer.Option("--headless", help="Only the notifier, without the tray app window.")
+    ] = False,
+):
+    """Start Nudge in the tray every time you sign in to Windows."""
+    from . import gui, startup
 
     try:
-        cmd = startup.install()
+        cmd = startup.install(app=not headless and gui.available())
     except RuntimeError as e:
         fail(str(e))
     console.print(f"[green]✓[/] Nudge will start at login:\n  [dim]{cmd}[/]")
@@ -590,6 +598,40 @@ def startup_status():
     except RuntimeError as e:
         fail(str(e))
     console.print(f"[green]On[/]: {cmd}" if cmd else "[yellow]Off[/]. Enable with `nudge startup install`.")
+
+
+@app.command("app")
+def open_app(
+    minimized: Annotated[bool, typer.Option("--minimized", help="Start hidden in the tray.")] = False,
+    web: Annotated[
+        int | None, typer.Option("--web", help="Serve the window in a browser on this port.")
+    ] = None,
+):
+    """Open the Nudge desktop window (also what `nudge` does on Windows)."""
+    from . import gui
+
+    if not gui.available():
+        fail("The desktop app needs Flet: uv tool install --reinstall . (or pip install flet)")
+    from .gui.app import run as run_app
+
+    run_app(minimized=minimized, web_port=web)
+
+
+@app.command()
+def shortcut(
+    desktop: Annotated[
+        bool, typer.Option("--desktop/--no-desktop", help="Also put one on the desktop.")
+    ] = True,
+):
+    """Add Nudge to the Start menu (and desktop) so it opens with a click."""
+    from . import startup
+
+    try:
+        paths = startup.create_shortcuts(desktop)
+    except RuntimeError as e:
+        fail(str(e))
+    for path in paths:
+        console.print(f"[green]✓[/] {path}")
 
 
 @app.command()

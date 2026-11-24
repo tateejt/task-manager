@@ -21,11 +21,15 @@ def test_quick_typed_title_splits_into_schedule(svc):
         await pilot.pause()
         form = app.screen
         assert isinstance(form, ReminderForm)
+        form.query_one("#title", Input).value = "Drink water #health every m"
+        await pilot.pause()
+        assert "Every minute" not in str(form.query_one("#preview").render())  # half-typed, nothing guessed
         form.query_one("#title", Input).value = "Drink water #health every 2 hours"
         await pilot.pause()
-        assert form.query_one("#title", Input).value == "Drink water #health"
-        assert form.query_one("#quick", Input).value == "every 2 hours"
-        assert "Every 2 hours" in str(form.query_one("#preview").render())
+        assert form.query_one("#title", Input).value == "Drink water #health every 2 hours"  # never rewritten
+        preview = str(form.query_one("#preview").render())
+        assert "Every 2 hours" in preview
+        assert "Drink water #health —" in preview
         await pilot.press("ctrl+s")
         await pilot.pause()
         r = svc.list()[0]
