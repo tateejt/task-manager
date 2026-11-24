@@ -484,9 +484,21 @@ def test_notify():
     from .models import Reminder
     from .notify import make_notifier
 
+    console.print(f"nudge {__version__}")
     r = Reminder(id=0, title="Nudge is working", notes="Notifications are set up correctly.", due_at=now())
-    make_notifier(queue.Queue(), console).show(r, nag=False, snooze_minutes=10, sound=Settings.load().sound)
-    console.print("[green]✓[/] Sent a test notification.")
+    notifier = make_notifier(queue.Queue(), console)
+    notifier.show(r, nag=False, snooze_minutes=10, sound=Settings.load().sound)
+    if type(notifier).__name__ == "WindowsToastNotifier":
+        brand = (
+            "as Nudge" if getattr(notifier, "branded", False) else "without the Nudge name (branding failed)"
+        )
+        console.print(
+            f"[green]✓[/] Sent a Windows notification {brand}. Look at the bottom-right of your screen."
+        )
+    else:
+        console.print(
+            "[yellow]![/] Windows notifications aren't available here, so it was printed above instead."
+        )
 
 
 @app.command("export")
@@ -627,9 +639,13 @@ def shortcut(
     from . import startup
 
     try:
-        paths = startup.create_shortcuts(desktop)
+        paths, errors = startup.create_shortcuts(desktop)
     except RuntimeError as e:
         fail(str(e))
+    for problem in errors:
+        err.print(f"[yellow]![/] Couldn't add the shortcut to {problem}")
+    if not paths:
+        fail("No shortcuts were made. You can still open the app by typing: nudge")
     for path in paths:
         console.print(f"[green]✓[/] {path}")
 

@@ -64,27 +64,60 @@ def status() -> str | None:
         return None
 
 
-def create_shortcuts(desktop: bool = True) -> list[Path]:
-    """Add "Nudge" to the Start menu (and optionally the desktop) so the app opens with a click."""
+#: Creates one .lnk. Windows itself says where the Start menu and desktop are, so a desktop that
+#: OneDrive (or a company policy) has moved still works. Paths come in through environment variables
+#: so spaces, apostrophes or non-English characters in them can't break the script.
+_SHORTCUT_PS = r"""
+$ErrorActionPreference = 'Stop'
+$dir = [Environment]::GetFolderPath($env:NUDGE_FOLDER)
+if (-not $dir) { throw "Windows has no $($env:NUDGE_FOLDER) folder for this user" }
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$lnk = Join-Path $dir 'Nudge.lnk'
+$s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+$s.TargetPath = $env:NUDGE_TARGET
+$s.Arguments = '-m nudge.gui'
+$s.WorkingDirectory = $env:USERPROFILE
+$s.IconLocation = $env:NUDGE_ICON
+$s.Description = 'Nudge reminders'
+$s.Save()
+Write-Output $lnk
+"""
+
+
+def shortcut_folders(desktop: bool = True) -> list[str]:
+    """Windows "special folder" names for where shortcuts go (Programs = the Start menu)."""
+    return ["Programs", "Desktop"] if desktop else ["Programs"]
+
+
+def create_shortcuts(desktop: bool = True) -> tuple[list[Path], list[str]]:
+    """Add "Nudge" to the Start menu (and optionally the desktop) so the app opens with a click.
+
+    Returns the shortcuts made and a readable error for each one that couldn't be made.
+    """
     _require_windows()
     import os
     import subprocess
 
     from .notify import asset_path
 
-    targets = [
-        Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Nudge.lnk"
-    ]
-    if desktop:
-        targets.append(Path(os.environ["USERPROFILE"]) / "Desktop" / "Nudge.lnk")
-    for lnk in targets:
-        script = (
-            "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:NUDGE_LNK);"
-            "$s.TargetPath=$env:NUDGE_TARGET;$s.Arguments='-m nudge.gui';"
-            "$s.IconLocation=$env:NUDGE_ICON;$s.Description='Nudge reminders';$s.Save()"
-        )
-        env = {**os.environ, "NUDGE_LNK": str(lnk), "NUDGE_TARGET": str(_pythonw()),
+    made: list[Path] = []
+    errors: list[str] = []
+    for folder in shortcut_folders(desktop):
+        env = {**os.environ, "NUDGE_FOLDER": folder, "NUDGE_TARGET": str(_pythonw()),
                "NUDGE_ICON": str(asset_path("nudge.ico"))}  # fmt: skip
-        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], check=True, env=env,
-                       capture_output=True)  # fmt: skip
-    return targets
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                 "-Command", _SHORTCUT_PS],
+                env=env, capture_output=True, text=True, timeout=60,
+            )  # fmt: skip
+        except (OSError, subprocess.TimeoutExpired) as e:
+            errors.append(f"{folder}: couldn't run PowerShell ({e})")
+            continue
+        out = (proc.stdout or "").strip().splitlines()
+        if proc.returncode == 0 and out:
+            made.append(Path(out[-1]))
+        else:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            errors.append(f"{folder}: {detail[0] if detail else f'PowerShell exited with {proc.returncode}'}")
+    return made, errors
