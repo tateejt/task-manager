@@ -1,6 +1,6 @@
 [project]
 name = "nudge"
-version = "0.3.0"
+version = "0.4.0"
 description = "A modern terminal reminder app for Windows with recurring schedules and actionable toast notifications."
 readme = "README.md"
 requires-python = ">=3.11"

@@ -26,6 +26,7 @@ from ..notify import Action, asset_path, make_notifier
 from ..runner import SingleInstance, tick
 from ..schedule import PRIORITY_LABEL, ScheduleError, explain, extract_inline_meta
 from ..service import AlreadyDone, NotFound, NothingToUndo, ReminderService
+from .notes import NotesMixin
 from .presenter import (
     Card,
     Parsed,
@@ -38,7 +39,13 @@ from .presenter import (
 )
 from .theme import DARK, FONTS, LIGHTS, Palette, pick
 
-TABS = [("today", "Today"), ("upcoming", "Upcoming"), ("all", "All"), ("history", "History")]
+TABS = [
+    ("today", "Today"),
+    ("upcoming", "Upcoming"),
+    ("all", "All"),
+    ("notes", "Notes"),
+    ("history", "History"),
+]
 SNOOZES = [
     (10, "10 minutes"),
     (30, "30 minutes"),
@@ -71,7 +78,7 @@ def _hovering(e) -> bool:
     return str(getattr(e, "data", "")).lower() == "true"
 
 
-class NudgeWindow:
+class NudgeWindow(NotesMixin):
     def __init__(self, page: ft.Page, service: ReminderService, *, minimized: bool = False):
         self.page = page
         self.service = service
@@ -87,6 +94,7 @@ class NudgeWindow:
         self.owns_runner = False
         self.tray = None
         self.p: Palette = DARK
+        self.init_notes()
 
     # ------------------------------------------------------------------ text helpers
 
@@ -149,6 +157,8 @@ class NudgeWindow:
         self.owns_runner = self.lock.acquire()
         p.run_task(self._loop)
         self._start_tray()
+        self.start_clipboard()
+        self.start_hotkey(Settings.load().pad_hotkey)
         if win is not None:
             win.prevent_close = self.tray is not None
             win.on_event = self._on_window_event
@@ -252,6 +262,7 @@ class NudgeWindow:
         if self.editor is not None:
             self.editor = InlineEditor(self, self.service.get(self.editor.rid)) if self._exists(
                 self.editor.rid) else None  # fmt: skip
+        self._input_mode()
         self._on_input(render=False)
         self.render()
 
@@ -340,6 +351,7 @@ class NudgeWindow:
         menu = pystray.Menu(
             pystray.MenuItem("Open Nudge", call(self.show_window), default=True),
             pystray.MenuItem("New reminder…", call(lambda: (self.show_window(), self.focus_input()))),
+            pystray.MenuItem("Scratchpad", call(self.open_pad)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit Nudge", call(self.quit)),
         )
@@ -357,6 +369,8 @@ class NudgeWindow:
         self.page.run_task(win.to_front)
 
     def quit(self) -> None:
+        if self.hotkey is not None:
+            self.hotkey.stop()
         if self.tray is not None:
             self.tray.stop()
         self.lock.release()
@@ -399,10 +413,14 @@ class NudgeWindow:
             self.undo()
         elif ctrl and key == ",":
             self.toggle_settings()
-        elif ctrl and key in ("1", "2", "3", "4"):
+        elif ctrl and key in ("1", "2", "3", "4", "5"):
             self.set_tab(TABS[int(key) - 1][0])
+        elif ctrl and e.shift and key == "c" and self.tab == "notes":
+            self.copy_current()
         elif key == "escape":
-            if self.editor is not None:
+            if self.pad_mode and not self.input.value:
+                self.exit_pad(hide=True)
+            elif self.editor is not None:
                 self.close_editor()
             elif self.settings_open:
                 self.toggle_settings()
@@ -413,6 +431,17 @@ class NudgeWindow:
     # ------------------------------------------------------------------ the input line
 
     def _on_input(self, render: bool = True) -> None:
+        if self.tab == "notes" and not self.settings_open:
+            query = self.notes_input()
+            self.result.visible = bool(self.result.value)
+            if render and query != self.query:
+                self.query = query
+                self.render()
+            else:
+                self.query = query
+                self._refresh(self.result)
+                self._refresh(self.detail)
+            return
         now = _now()
         self.parsed = parse_input(self.input.value or "", now)
         pr = self.parsed
@@ -443,6 +472,9 @@ class NudgeWindow:
             self._refresh(self.detail)
 
     def submit(self) -> None:
+        if self.tab == "notes" and not self.settings_open:
+            self.notes_submit()
+            return
         pr = self.parsed
         if pr.mode == "search":
             return
@@ -468,10 +500,23 @@ class NudgeWindow:
     # ------------------------------------------------------------------ tabs and lists
 
     def set_tab(self, tab: str) -> None:
+        if tab != "notes":
+            self.exit_pad()
+        changed = (tab == "notes") != (self.tab == "notes")
         self.tab = tab
         self.settings_open = False
         self.editor = None
+        if changed:
+            self.input.value = ""
+            self.query = ""
+            self._input_mode()
+            self._on_input(render=False)
         self.render()
+
+    def _input_mode(self) -> None:
+        notes = self.tab == "notes"
+        self.input.hint_text = "Jot a value…" if notes else "Remind me to…"
+        self.hints.value = "Ctrl+Shift+C copy all · Esc" if notes else "Ctrl+K new · Ctrl+Z undo"
 
     def toggle_settings(self) -> None:
         self.settings_open = not self.settings_open
@@ -490,6 +535,8 @@ class NudgeWindow:
             items = self.upcoming_view(now)
         elif self.tab == "all":
             items = self.all_view(reminders, now)
+        elif self.tab == "notes":
+            items = self.notes_view(now)
         else:
             items = self.history_view(now)
         self.body.controls = items
@@ -906,7 +953,8 @@ class NudgeWindow:
         self.render()
         self.flash(f"Undid {action}: {r.title}")
 
-    def flash(self, message: str, *, undo: bool = False, warning: bool = False) -> None:
+    def flash(self, message: str, *, undo: bool = False, warning: bool = False,
+              undo_action: Callable | None = None) -> None:  # fmt: skip
         """Show a short message in the status bar (with Undo) for a few seconds."""
         self.flash_token += 1
         token = self.flash_token
@@ -925,8 +973,8 @@ class NudgeWindow:
                 expand=True,
             ),  # fmt: skip
         ]
-        if undo:
-            controls.append(self.link("Undo", self.undo, tone="accent"))
+        if undo or undo_action:
+            controls.append(self.link("Undo", undo_action or self.undo, tone="accent"))
         self.status.controls = controls
         self.page.update()
 
@@ -953,6 +1001,9 @@ class NudgeWindow:
             s.save()
             if key == "theme":
                 self.build()
+            if key == "pad_hotkey":
+                self.start_hotkey(s.pad_hotkey)
+                self.render()
             self.flash("Saved")
 
         def field(key: str, width: int = 56, hint: str = "") -> ft.Control:
@@ -1062,6 +1113,11 @@ class NudgeWindow:
             ),  # fmt: skip
             self.section_label("System"),
             line("Open Nudge when I sign in", startup_ctrl, "Lives in the tray and keeps reminding you"),
+            line(
+                "Scratchpad shortcut",
+                field("pad_hotkey", 130, "win+shift+n"),
+                f"Opens the scratchpad from any app · {self.hotkey_status(st.pad_hotkey)}",
+            ),
             line(
                 "Notifications",
                 self.text("this window" if self.owns_runner else "nudge run", size=12, tone="dim", mono=True),
@@ -1246,12 +1302,15 @@ class InlineEditor:
         )
 
 
-def run(*, minimized: bool = False, web_port: int | None = None) -> None:
+def run(*, minimized: bool = False, web_port: int | None = None, pad: bool = False) -> None:
     """Open the Nudge window. ``web_port`` serves it in a browser instead (used for screenshots/tests)."""
     service = ReminderService(db_path())
 
     def main(page: ft.Page) -> None:
-        NudgeWindow(page, service, minimized=minimized).start()
+        w = NudgeWindow(page, service, minimized=minimized)
+        w.start()
+        if pad:
+            w.open_pad()
 
     assets = str(asset_path("nudge.png").parent)
     if web_port:

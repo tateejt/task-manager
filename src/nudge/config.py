@@ -48,6 +48,8 @@ class Settings:
     sound: bool = True
     #: Desktop app appearance: system, dark or light.
     theme: str = "system"
+    #: System-wide shortcut that opens the scratchpad (Windows), e.g. "win+shift+n". Empty disables.
+    pad_hotkey: str = "win+shift+n"
 
     @classmethod
     def load(cls) -> Settings:
@@ -77,6 +79,11 @@ class Settings:
             parsed = value.strip()
             if key.startswith("quiet_") and parsed:
                 _parse_hhmm(str(parsed))
+            if key == "pad_hotkey" and parsed:
+                from .hotkey import parse
+
+                parse(str(parsed))
+                parsed = str(parsed).lower().replace(" ", "")
             if key == "theme" and parsed not in ("system", "dark", "light"):
                 raise ValueError("theme must be system, dark or light")
         setattr(self, key, parsed)

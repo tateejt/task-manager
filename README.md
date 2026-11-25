@@ -22,6 +22,14 @@ nudge run          # or: nudge startup install
   (Today, Upcoming, All, History) with one-click Done, Snooze and Skip, and clicking a row edits it in place.
   `Ctrl+K` new, `Ctrl+Z` undo, `/word` or `#tag` to search. Closing the window keeps Nudge in the tray, where it
   keeps sending notifications. The terminal dashboard is still available with `nudge tui`.
+- **Scratchpad for support work**: press **Win+Shift+N** anywhere and a small always-on-top pad opens
+  (or use the Notes tab). Type values as you go: `case 48213`, then `INB exported 1,240`, `INB returned: 42`,
+  or anything at all as a plain note. It opens on a blank page (New page starts another). Type
+  `save template INB` to reuse a page's labels, then `t inb` (or click it) to start a page with those fields and
+  just type the values: each one fills the next field. Lines with a value are saved as a label and value. **Copy all** (Ctrl+Shift+C) gives
+  you a clean summary to paste into the case or an email, and clicking a value copies just that value. Older
+  cases stay searchable (`/48213`). Esc hides the pad again. From a terminal: `nudge note INB exported 1,240 -c 48213`
+  and `nudge notes --copy`.
 - **No exact wording needed**: typos and casual phrasing work (`evry thrusday 9.30am`, `mondays and fridays at 6`,
   `twice a day`, `everyday at 8`). Nudge always shows what it understood and the next few times before saving.
 - **Guided form**: press `a` in the dashboard to pick the repeat pattern, days and times from a form, with a live
@@ -73,6 +81,9 @@ For development: `uv sync`, then `uv run pytest` and `uv run nudge ...`.
 | --- | --- |
 | `nudge` / `nudge app` | Desktop window (terminal dashboard if the app isn't available) |
 | `nudge tui` | Terminal dashboard |
+| `nudge pad` | Open the scratchpad |
+| `nudge note TEXT [-c CASE]` | Jot a value (`INB exported 1,240`) under a case |
+| `nudge notes [-c CASE] [-s TEXT] [--copy]` | Notes grouped by case, ready to paste |
 | `nudge shortcut` | Start-menu (and desktop) shortcut |
 | `nudge add [TITLE] [WHEN...]` | Add a reminder (`-t tag`, `-p priority`, `-n notes`); no args = step by step |
 | `nudge preview WHEN...` | Check what a schedule means and its next times |
@@ -120,6 +131,7 @@ For development: `uv sync`, then `uv run pytest` and `uv run nudge ...`.
 | `poll_seconds` | 20 | How often the runner checks |
 | `sound` | true | Play a sound |
 | `theme` | system | Desktop app look: system, dark or light |
+| `pad_hotkey` | win+shift+n | Shortcut that opens the scratchpad from any app (empty = off) |
 
 Data lives in `%LOCALAPPDATA%\nudge` (`nudge config show` prints the folder). Set `NUDGE_HOME` to use another.
 
@@ -133,12 +145,14 @@ src/nudge/
   runner.py     the background loop; toast button clicks come back through a queue
   notify.py     notification content + Windows toasts (windows-toasts), console fallback elsewhere
   forms.py      the guided new/edit form with live preview (Textual)
-  gui/          the desktop window (Flet): app.py window + tray, presenter.py display logic, theme.py
+  gui/          the desktop window (Flet): app.py window + tray, notes.py scratchpad, presenter.py, theme.py
   assets/       app and notification icons (tools/make_icons.py) and fonts (Inter, JetBrains Mono; OFL)
   startup.py    HKCU Run key so the runner starts at sign-in via pythonw (no window)
   cli.py        Typer + Rich commands
   tui.py        Textual dashboard
   transfer.py   YAML / CSV import and export
+  scratch.py    scratchpad: label/value parsing, cases, paste-ready summaries
+  hotkey.py     system-wide shortcut (Win32 RegisterHotKey); clip.py native clipboard
 ```
 
 Times are stored as local wall-clock times, so "every day at 9am" stays at 9am across daylight saving changes.
