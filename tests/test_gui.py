@@ -246,3 +246,30 @@ def test_notes_tab(window, svc):
     assert window.pad_mode and window.tab == "notes"
     window.set_tab("today")
     assert not window.pad_mode and window.input.hint_text == "Remind me to…"
+
+
+def test_notes_blank_page_and_templates(window):
+    window.set_tab("notes")
+    assert window.case_ref is None  # starts blank
+    for line in ["INB exported 1,240", "INB imported 1,198", "INB returned 42"]:
+        window.input.value = line
+        window._on_input()
+        window.submit()
+    page = window.case_ref
+    assert page.startswith("note-")
+    window.input.value = "save template INB"
+    window._on_input()
+    assert window.result.value == "save template INB" and "3 fields" in window.detail.value
+    window.submit()
+    assert [t.name for t in window.pad.templates()] == ["INB"]
+
+    window.new_page()
+    assert window.case_ref is None
+    window.use_template("INB")
+    assert window.case_ref != page
+    window.input.value = "980"
+    window._on_input()
+    assert window.result.value == "INB exported = 980"
+    window.submit()
+    window.copy_current()
+    assert window.last_copied.splitlines()[1:] == ["INB exported: 980"]

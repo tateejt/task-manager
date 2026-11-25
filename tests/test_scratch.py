@@ -97,3 +97,48 @@ def test_cli_note_and_notes(isolated_home):
     out = r.invoke(app, ["notes", "--copy"]).output
     assert "INB exported: 1,240" in out and "INB returned: 42" in out
     assert "No notes" in r.invoke(app, ["notes", "-s", "nothing-here"]).output
+
+
+def test_templates_and_blank_pages(svc):
+    pad = ScratchPad(svc.engine)
+    page = pad.new_page(now=NOW)
+    assert page.ref.startswith("note-") and pad.new_page(now=NOW).ref != page.ref
+    for line in ["INB exported 1,240", "INB imported 1,198", "INB returned 42", "all good"]:
+        pad.add(line, case=page.ref, now=NOW)
+    t = pad.save_template("INB check", page.ref)
+    assert t.field_list == ["INB exported", "INB imported", "INB returned"]
+    assert pad.save_template("inb CHECK", page.ref).id == t.id  # same name replaces
+
+    nxt = pad.new_page(now=NOW + timedelta(hours=1))
+    pad.apply_template("inb check", nxt.ref)
+    g = pad.group_for(nxt.ref)
+    assert [e.label for e in g.entries] == t.field_list and g.next_empty.label == "INB exported"
+    pad.add("980", case=nxt.ref)  # a bare value fills the next empty field
+    pad.add("INB returned 5", case=nxt.ref)  # a named one fills that field
+    pad.add("975", case=nxt.ref)
+    pad.add("12", case=nxt.ref)  # nothing left to fill: kept as a note
+    g = pad.group_for(nxt.ref)
+    assert [(e.label, e.value) for e in g.entries] == [
+        ("INB exported", "980"),
+        ("INB imported", "975"),
+        ("INB returned", "5"),
+        ("", "12"),
+    ]
+    assert summary(g).splitlines()[0].startswith("Notes (")
+    assert g.title == "Quick note"
+
+    empty = pad.new_page()
+    pad.apply_template("INB check", empty.ref)
+    assert "INB" not in summary(pad.group_for(empty.ref)).split("\n", 1)[-1]  # empty fields aren't copied
+
+    with pytest.raises(ValueError):
+        pad.save_template("nothing", pad.new_page().ref)
+    pad.delete_template("INB check")
+    assert pad.templates() == []
+
+
+def test_parse_template_commands():
+    assert parse_line("t inb").kind == "template" and parse_line("template INB check").value == "INB check"
+    assert parse_line("save template INB").kind == "save_template"
+    assert parse_line("save as draft").kind == "note"
+    assert parse_line("1,240").kind == "value"

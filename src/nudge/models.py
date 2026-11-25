@@ -101,3 +101,16 @@ class Entry(SQLModel, table=True):
     @property
     def text(self) -> str:
         return f"{self.label}: {self.value}" if self.label else self.value
+
+
+class Template(SQLModel, table=True):
+    """A reusable list of fields (labels) to start a scratchpad page from, e.g. INB exported/imported/returned."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(index=True, unique=True)
+    fields: str = ""  # one label per line, in order
+    created_at: NaiveDatetime = Field(default_factory=lambda: datetime.now().replace(microsecond=0))
+
+    @property
+    def field_list(self) -> list[str]:
+        return [f for f in self.fields.splitlines() if f.strip()]

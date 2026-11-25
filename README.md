@@ -24,7 +24,9 @@ nudge run          # or: nudge startup install
   keeps sending notifications. The terminal dashboard is still available with `nudge tui`.
 - **Scratchpad for support work**: press **Win+Shift+N** anywhere and a small always-on-top pad opens
   (or use the Notes tab). Type values as you go: `case 48213`, then `INB exported 1,240`, `INB returned: 42`,
-  or a plain note. Each line is saved as a label and value under the case. **Copy all** (Ctrl+Shift+C) gives
+  or anything at all as a plain note. It opens on a blank page (New page starts another). Type
+  `save template INB` to reuse a page's labels, then `t inb` (or click it) to start a page with those fields and
+  just type the values: each one fills the next field. Lines with a value are saved as a label and value. **Copy all** (Ctrl+Shift+C) gives
   you a clean summary to paste into the case or an email, and clicking a value copies just that value. Older
   cases stay searchable (`/48213`). Esc hides the pad again. From a terminal: `nudge note INB exported 1,240 -c 48213`
   and `nudge notes --copy`.
